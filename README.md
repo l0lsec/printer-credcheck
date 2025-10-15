@@ -1,7 +1,14 @@
-## ricohprint_defaultadmincheck.py
+## ricohprint_defaultcredchecker.py
 
 ### Overview
-This script sends a default Ricoh printer web login POST to each host from a provided file and reports whether authentication succeeded, failed, or encountered an error.
+This script tests Ricoh printers for default credentials (admin with empty password) by sending authenticated web login requests. It can also export address books from printers with successful default credentials.
+
+### Features
+- **Credential Testing**: Checks if printers still use default admin credentials
+- **Address Book Export**: Automatically exports address books from vulnerable printers
+- **Email & Name Extraction**: Automatically parses exported address books and extracts all emails and names
+- **Concurrent Scanning**: Multi-threaded for fast scanning of multiple devices
+- **Verbose Mode**: Detailed debugging output showing all HTTP requests/responses
 
 ### Hosts file format
 Provide one host or URL per line. Lines beginning with `#` and blank lines are ignored.
@@ -19,58 +26,264 @@ https://10.10.62.21
 
 ### Usage
 ```bash
-python3 ricohprint_defaultadmincheck.py /path/to/hosts.txt [--scheme https] [--timeout 10] [--workers 10] [--verify]
+python3 ricohprint_defaultcredchecker.py /path/to/hosts.txt [OPTIONS]
 ```
 
 #### Arguments
 - `hosts_file`: Path to the file with hosts/URLs (one per line)
 - `--scheme {http,https}`: Default scheme if a line omits it (default: `https`)
-- `--timeout <int>`: Request timeout in seconds (default: `10`)
+- `--timeout <int>`: Request timeout in seconds for login requests (default: `10`)
 - `--workers <int>`: Number of concurrent workers (default: `10`)
-- `--verify`: Enable TLS certificate verification (disabled by default). When omitted, TLS verification is off and the script suppresses the related warning.
+- `--verify`: Enable TLS certificate verification (disabled by default)
+- `--export`: Export address books from printers with successful default credentials
+- `--output-dir <path>`: Output directory for exported address books (default: current directory)
+- `--export-timeout <int>`: Timeout in seconds for address book export requests (default: `30`)
+- `--verbose`: Enable verbose output showing all HTTP requests and responses
 
 ### Examples
-- Minimal run (default https, 10 workers, 10s timeout, TLS verification off):
+
+#### Basic credential check (no export)
 ```bash
-python3 ricohprint_defaultadmincheck.py ./hosts.txt
+python3 ricohprint_defaultcredchecker.py ./hosts.txt
 ```
 
-- Specify concurrency and enable TLS verification:
+#### Check credentials AND export address books
 ```bash
-python3 ricohprint_defaultadmincheck.py ./hosts.txt --workers 20 --verify
+python3 ricohprint_defaultcredchecker.py ./hosts.txt --export
 ```
 
-- Use HTTP for hosts without a scheme:
+#### Export with custom timeout and output directory
 ```bash
-python3 ricohprint_defaultadmincheck.py ./hosts.txt --scheme http
+python3 ricohprint_defaultcredchecker.py ./hosts.txt --export --export-timeout 60 --output-dir ./exports
+```
+
+#### Use HTTP and enable verbose debugging
+```bash
+python3 ricohprint_defaultcredchecker.py ./hosts.txt --scheme http --export --verbose
+```
+
+#### Scan with more workers and enable TLS verification
+```bash
+python3 ricohprint_defaultcredchecker.py ./hosts.txt --workers 20 --verify --export
 ```
 
 ### Output
+
+#### Basic credential check output
 Per-host line with outcome and HTTP status:
 ```text
-10.10.62.20	FAIL	status=200
-10.10.62.21	SUCCESS	status=200
-10.10.62.22	ERROR: HTTP 404	status=404
+10.10.62.20     FAIL    status=302
+10.10.62.21     SUCCESS status=302
+10.10.62.22     ERROR: HTTP 404     status=404
 ```
 
-A final tally is printed:
+#### With address book export enabled
 ```text
-Total: 3	SUCCESS: 1	FAIL: 1	ERROR: 1
+10.10.62.20     FAIL    status=302
+10.10.62.21     SUCCESS status=302
+10.10.62.21     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.21.txt
+10.10.62.22     SUCCESS status=302
+10.10.62.22     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.22.txt
+```
+
+#### Final summary
+```text
+Total: 3        SUCCESS: 2      FAIL: 1 ERROR: 0        EXPORTED: 2
+
+Extracting emails from address books...
+Extracted 15 unique email(s) to ./extracted_emails.txt
+
+Extracting names from address books...
+Extracted 18 unique name(s) to ./extracted_names.txt
 ```
 
 ### Result interpretation
-- **SUCCESS**: HTTP 200 and the response does not contain the string `Authentication has failed`.
-- **FAIL**: Response body contains `Authentication has failed`.
-- **ERROR: HTTP <code>**: Non-200 HTTP status code returned.
-- **ERROR: <exception>**: Network or TLS error occurred while making the request.
+- **SUCCESS**: Login succeeded with default credentials (HTTP 302 redirect to mainFrame.cgi)
+- **FAIL**: Authentication failed (redirect to authForm.cgi or "Authentication has failed" in response)
+- **ERROR: HTTP <code>**: Unexpected HTTP status code returned
+- **ERROR: <exception>**: Network or TLS error occurred while making the request
+- **EXPORT: SUCCESS**: Address book successfully exported to file
+- **EXPORT: ERROR**: Address book export failed (details included in message)
+
+### Address Book Export
+
+When `--export` is enabled, the script performs a three-step process for each printer with successful default credentials:
+
+1. **Login**: Authenticate with default credentials (admin/empty password)
+   - Captures `wimsesid` and `risessionid` cookies from 302 response
+
+2. **Navigate to Address List**: Access the address book section
+   - Gets a fresh `risessionid` specific to the address book module
+
+3. **Export Data**: Download the address book entries
+   - Saves data to `addressbook_<hostname>.txt` in JSON-like array format
+
+#### Exported Data Format
+Address books are saved as plain text files containing arrays of contact entries:
+```
+[[28,1,'00001','Accounting Scans','','1665508224#Oct 11,2022 12:10 PM','','\\\\DC-12DC\\VC_Data\\Scans'],
+ [29,2,'00002','Corp Acctng','','0000000000#--- --,---- --:-- --','',''],
+ [30,1,'00003','John Doe','','1653592843#May 26,2022 02:20 PM','john.doe@example.com','']]
+```
+
+Each entry contains: ID, type, number, name, description, timestamp, email, and network path.
+
+#### Automatic Email & Name Extraction
+
+After all address books are exported, the script automatically parses them and extracts:
+
+1. **Emails**: Extracts all email addresses (index 6 in each entry)
+   - Basic validation: must contain `@` and `.`
+   - Duplicates are automatically removed
+   - Saved to `extracted_emails.txt` (one email per line, sorted alphabetically)
+
+2. **Names**: Extracts all contact names (index 3 in each entry)
+   - Filters out empty values
+   - Duplicates are automatically removed  
+   - Saved to `extracted_names.txt` (one name per line, sorted alphabetically)
+
+**Example extracted_emails.txt:**
+```
+accounting@example.com
+hr@example.com
+john.doe@example.com
+sales@example.com
+```
+
+**Example extracted_names.txt:**
+```
+Accounting Scans
+Corp Acctng
+HR Department
+John Doe
+Sales Team
+```
+
+This automated extraction happens only when `--export` is used and at least one address book is successfully exported.
+
+### Verbose Mode
+
+With `--verbose`, the script displays detailed information about each HTTP transaction:
+
+```text
+================================================================================
+[LOGIN REQUEST] 10.9.65.127
+================================================================================
+POST http://10.9.65.127/web/guest/en/websys/webArch/login.cgi
+
+Headers:
+  User-Agent: Mozilla/5.0...
+  Content-Type: application/x-www-form-urlencoded
+  ...
+
+Cookies:
+  risessionid: 012450409054315
+  cookieOnOffChecker: on
+  wimsesid: --
+
+Form Data:
+  userid: YWRtaW4=
+  password: 
+  ...
+================================================================================
+
+================================================================================
+[LOGIN RESPONSE] 10.9.65.127
+================================================================================
+Status: 302
+
+Response Headers:
+  Set-Cookie: risessionid=066124883298009;HttpOnly
+  Set-Cookie: wimsesid=178962527;path=/;HttpOnly
+  Location: /web/entry/en/websys/webArch/mainFrame.cgi
+  ...
+
+Response Body (105 bytes):
+<html><head><title>302 Moved Temporarily</title></head>...
+================================================================================
+
+[DEBUG] 10.9.65.127: Manually parsed Set-Cookie: {'risessionid': '066124883298009', 'wimsesid': '178962527'}
+[DEBUG] 10.9.65.127: Final captured cookies for session: {...}
+```
+
+This is useful for:
+- Troubleshooting authentication issues
+- Verifying cookie capture
+- Understanding the authentication flow
+- Debugging network problems
 
 ### Exit codes
-- `0`: At least one host produced a `SUCCESS` or `FAIL` result (i.e., requests completed and were interpretable).
-- `1`: No hosts were found in the file, or all attempts resulted in errors (no `SUCCESS`/`FAIL`).
+- `0`: At least one host produced a `SUCCESS` or `FAIL` result (requests completed successfully)
+- `1`: No hosts were found in the file, or all attempts resulted in errors
 
-### Notes and caveats
-- TLS verification is disabled by default to facilitate scanning devices with self-signed certificates. Use `--verify` in trusted networks when you need certificate validation.
-- The script uses the request metadata and default credentials provided. If those change, update the script accordingly.
-- Be mindful of legal and policy constraints when testing authentication against devices you do not own or administer.
+### Security Notes and Best Practices
 
+⚠️ **Important Security Considerations:**
 
+1. **Legal Authorization**: Only scan devices you own or have explicit permission to test
+2. **Network Impact**: Be mindful of the load on production systems
+3. **Credential Testing**: This script tests for default credentials which is a security assessment activity
+4. **Data Handling**: Exported address books may contain sensitive contact information (emails, names, network paths)
+5. **TLS Verification**: Disabled by default to handle self-signed certificates - use `--verify` in trusted environments
+
+**Recommendations:**
+- Store exported address books and extracted files securely
+- Notify device administrators of findings
+- Delete exported data (`addressbook_*.txt`, `extracted_emails.txt`, `extracted_names.txt`) after analysis
+- Use this tool as part of a broader security assessment
+- Respect rate limits and timeout settings on production networks
+
+### Technical Notes
+
+#### Authentication Flow
+The script implements the Ricoh printer web interface authentication:
+1. Default credentials: Username `admin` (base64 encoded as `YWRtaW4=`), empty password
+2. Successful login returns HTTP 302 redirect with session cookies
+3. The script properly handles duplicate cookie values in Set-Cookie headers
+4. Address book access requires session-specific `risessionid` cookie
+
+#### Cookie Handling
+The script includes special logic to handle Ricoh's cookie implementation:
+- Parses Set-Cookie headers manually to capture the correct session IDs
+- Filters out reset values (`wimsesid=--`)
+- Maintains separate cookies for different application sections
+
+#### Multi-threading
+- Uses `ThreadPoolExecutor` for concurrent requests
+- Default: 10 workers (adjustable with `--workers`)
+- Each host is processed independently
+
+### Troubleshooting
+
+**Issue**: Login shows SUCCESS but export fails
+- Try increasing `--export-timeout` (some printers are slow)
+- Use `--verbose` to see detailed request/response data
+- Verify the printer has an address book configured
+
+**Issue**: All requests timeout
+- Increase `--timeout` value
+- Check network connectivity to printers
+- Verify the scheme (http vs https) is correct
+
+**Issue**: TLS/SSL errors
+- Use `--scheme http` if printers don't support HTTPS
+- Use `--verify` flag only if you trust the certificates
+- Check if printers are on correct ports
+
+**Issue**: Exported files are empty or contain error messages
+- Printer may have logged out the session (rare race condition)
+- Use `--verbose` to see what data was received
+- Verify printer firmware version is compatible
+
+**Issue**: Email/name extraction shows 0 results despite successful exports
+- Verify the `addressbook_*.txt` files contain data in the expected format
+- The extraction expects array format: `[[id, type, number, name, ..., email, ...], ...]`
+- Use `--verbose` to see the raw export data
+- Some printers may use a different address book format (not yet supported)
+
+### Requirements
+- Python 3.6+
+- `requests` library (`pip install requests`)
+
+### License
+Use responsibly and only on systems you own or have permission to test.
