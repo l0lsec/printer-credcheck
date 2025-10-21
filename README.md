@@ -1,14 +1,33 @@
 ## ricohprint_defaultcredchecker.py
 
 ### Overview
-This script tests Ricoh printers for default credentials (admin with empty password) by sending authenticated web login requests. It can also export address books from printers with successful default credentials.
+This script tests Ricoh printers for default credentials (admin and supervisor with empty passwords) by sending authenticated web login requests. It can also export address books from printers with successful default admin credentials.
 
 ### Features
-- **Credential Testing**: Checks if printers still use default admin credentials
-- **Address Book Export**: Automatically exports address books from vulnerable printers
+- **Ricoh Printer Detection**: Pre-checks each host to verify it's a Ricoh printer before testing credentials (reduces false positives)
+- **Credential Testing**: Checks if printers still use default admin and supervisor credentials
+- **Successful Login Export**: Automatically saves all successful logins to a tab-delimited file
+- **Address Book Export**: Automatically exports address books from vulnerable printers (admin account only)
 - **Email & Name Extraction**: Automatically parses exported address books and extracts all emails and names
+- **Real-Time Progress**: Shows progress counter as tests complete
 - **Concurrent Scanning**: Multi-threaded for fast scanning of multiple devices
 - **Verbose Mode**: Detailed debugging output showing all HTTP requests/responses
+
+### Default Accounts Tested
+- **admin** (with blank password) - Can export address books if successful
+- **supervisor** (with blank password) - Cannot export address books (limited privileges)
+
+### How Ricoh Detection Works
+To minimize false positives, the script first verifies each host is a Ricoh printer by:
+1. Sending a GET request to `/web/guest/en/websys/webArch/mainFrame.cgi`
+2. Checking for Ricoh-specific indicators in the response:
+   - "RICOH" in the page content
+   - "Web Image Monitor" (Ricoh's web interface name)
+   - Ricoh-specific paths like `websys/webArch`, `/web/guest/`
+   - Redirects to authentication pages like `authForm.cgi`
+3. Only testing credentials on devices that pass this verification
+
+This prevents testing credentials on non-Ricoh devices that might accept any username/password (causing false positives).
 
 ### Hosts file format
 Provide one host or URL per line. Lines beginning with `#` and blank lines are ignored.
@@ -38,6 +57,7 @@ python3 ricohprint_defaultcredchecker.py /path/to/hosts.txt [OPTIONS]
 - `--export`: Export address books from printers with successful default credentials
 - `--output-dir <path>`: Output directory for exported address books (default: current directory)
 - `--export-timeout <int>`: Timeout in seconds for address book export requests (default: `30`)
+- `--success-file <path>`: Output file for successful logins in tab-delimited format (default: `successful_logins.txt`)
 - `--verbose`: Enable verbose output showing all HTTP requests and responses
 
 ### Examples
@@ -67,28 +87,78 @@ python3 ricohprint_defaultcredchecker.py ./hosts.txt --scheme http --export --ve
 python3 ricohprint_defaultcredchecker.py ./hosts.txt --workers 20 --verify --export
 ```
 
+#### Specify custom output file for successful logins
+```bash
+python3 ricohprint_defaultcredchecker.py ./hosts.txt --success-file ./results/logins.txt
+```
+
 ### Output
 
+The script runs in two stages:
+1. **Stage 1**: Checks each host to verify it's a Ricoh printer
+2. **Stage 2**: Tests credentials only on confirmed Ricoh printers
+
 #### Basic credential check output
-Per-host line with outcome and HTTP status:
 ```text
-10.10.62.20     FAIL    status=302
-10.10.62.21     SUCCESS status=302
-10.10.62.22     ERROR: HTTP 404     status=404
+Step 1: Checking if 5 host(s) are Ricoh printers...
+Workers: 10
+--------------------------------------------------------------------------------
+✓ 10.10.62.20	Ricoh printer detected (found: RICOH, Web Image Monitor, /web/guest/)
+✗ 10.1.96.25	SKIPPED: Not a Ricoh printer (no Ricoh indicators found in response)
+✓ 10.10.62.21	Ricoh printer detected (redirect to auth page)
+✗ 10.1.96.44	SKIPPED: Not a Ricoh printer (HTTP 404 - page not found)
+✓ 10.10.62.22	Ricoh printer detected (found: RICOH, websys/webArch, /web/guest/)
+
+--------------------------------------------------------------------------------
+Step 2: Testing credentials on 3 confirmed Ricoh printer(s)...
+Testing usernames: admin, supervisor
+Total credential tests: 6
+--------------------------------------------------------------------------------
+[1/6] 10.10.62.20     admin           FAIL    status=302
+[2/6] 10.10.62.20     supervisor      FAIL    status=302
+[3/6] 10.10.62.21     admin           SUCCESS status=302
+[4/6] 10.10.62.21     supervisor      SUCCESS status=302
+[5/6] 10.10.62.22     admin           SUCCESS status=302
+[6/6] 10.10.62.22     supervisor      FAIL    status=302
 ```
 
 #### With address book export enabled
 ```text
-10.10.62.20     FAIL    status=302
-10.10.62.21     SUCCESS status=302
-10.10.62.21     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.21.txt
-10.10.62.22     SUCCESS status=302
-10.10.62.22     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.22.txt
+Step 1: Checking if 3 host(s) are Ricoh printers...
+Workers: 10
+--------------------------------------------------------------------------------
+✓ 10.10.62.20	Ricoh printer detected (found: RICOH, Web Image Monitor)
+✓ 10.10.62.21	Ricoh printer detected (found: RICOH, /web/guest/)
+✓ 10.10.62.22	Ricoh printer detected (redirect to auth page)
+
+--------------------------------------------------------------------------------
+Step 2: Testing credentials on 3 confirmed Ricoh printer(s)...
+Testing usernames: admin, supervisor
+Total credential tests: 6
+--------------------------------------------------------------------------------
+[1/6] 10.10.62.20     admin           FAIL    status=302
+[2/6] 10.10.62.20     supervisor      FAIL    status=302
+[3/6] 10.10.62.21     admin           SUCCESS status=302
+[3/6] 10.10.62.21     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.21.txt
+[4/6] 10.10.62.21     supervisor      SUCCESS status=302
+[5/6] 10.10.62.22     admin           SUCCESS status=302
+[5/6] 10.10.62.22     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.22.txt
+[6/6] 10.10.62.22     supervisor      FAIL    status=302
 ```
+
+**Note**: 
+- **Stage 1** filters out non-Ricoh devices to prevent false positives
+- **Stage 2** progress counter `[X/Y]` shows current progress in real-time as tests complete
+- Results appear immediately as workers finish (not sorted by host during execution)
+- Address books are only exported for successful admin logins
+- The supervisor account has limited privileges and cannot export address books
 
 #### Final summary
 ```text
-Total: 3        SUCCESS: 2      FAIL: 1 ERROR: 0        EXPORTED: 2
+Total Hosts: 5	Ricoh Printers: 3	Skipped: 2
+Credential Tests: 6	SUCCESS: 4	FAIL: 2	ERROR: 0	EXPORTED: 2
+
+Successful logins saved to: successful_logins.txt (4 entry/entries)
 
 Extracting emails from address books...
 Extracted 15 unique email(s) to ./extracted_emails.txt
@@ -96,6 +166,23 @@ Extracted 15 unique email(s) to ./extracted_emails.txt
 Extracting names from address books...
 Extracted 18 unique name(s) to ./extracted_names.txt
 ```
+
+#### Successful Logins File Format
+The `successful_logins.txt` file contains tab-delimited entries for all successful default credential logins:
+```text
+# Format: AssetName	URI	Protocol	Port	Output
+10.10.62.21	10.10.62.21	tcp	443	Successful login with username 'admin' and blank password (HTTP 302)
+10.10.62.21	10.10.62.21	tcp	443	Successful login with username 'supervisor' and blank password (HTTP 302)
+10.10.62.22:8080	10.10.62.22:8080	tcp	8080	Successful login with username 'admin' and blank password (HTTP 302)
+192.168.1.50	192.168.1.50	tcp	80	Successful login with username 'admin' and blank password (HTTP 302)
+```
+
+**Format Details:**
+- **AssetName**: The host/IP (matches EngagementAsset)
+- **URI**: The host/IP with optional port
+- **Protocol**: `tcp` (web services use TCP)
+- **Port**: `443` for HTTPS, `80` for HTTP, or custom port if specified
+- **Output**: Description of the successful login including username and HTTP status
 
 ### Result interpretation
 - **SUCCESS**: Login succeeded with default credentials (HTTP 302 redirect to mainFrame.cgi)
