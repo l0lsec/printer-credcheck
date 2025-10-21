@@ -6,7 +6,7 @@ This script tests Ricoh printers for default credentials (admin and supervisor w
 ### Features
 - **Ricoh Printer Detection**: Pre-checks each host to verify it's a Ricoh printer before testing credentials (reduces false positives)
 - **Credential Testing**: Checks if printers still use default admin and supervisor credentials
-- **Successful Login Export**: Automatically saves all successful logins to a tab-delimited file
+- **Successful Login Export**: Automatically saves all successful logins to a backtick-delimited file
 - **Address Book Export**: Automatically exports address books from vulnerable printers (admin account only)
 - **Email & Name Extraction**: Automatically parses exported address books and extracts all emails and names
 - **Real-Time Progress**: Shows progress counter as tests complete
@@ -57,7 +57,7 @@ python3 ricohprint_defaultcredchecker.py /path/to/hosts.txt [OPTIONS]
 - `--export`: Export address books from printers with successful default credentials
 - `--output-dir <path>`: Output directory for exported address books (default: current directory)
 - `--export-timeout <int>`: Timeout in seconds for address book export requests (default: `30`)
-- `--success-file <path>`: Output file for successful logins in tab-delimited format (default: `successful_logins.txt`)
+- `--success-file <path>`: Output file for successful logins in backtick-delimited format (default: `successful_logins.txt`)
 - `--verbose`: Enable verbose output showing all HTTP requests and responses
 
 ### Examples
@@ -168,16 +168,17 @@ Extracted 18 unique name(s) to ./extracted_names.txt
 ```
 
 #### Successful Logins File Format
-The `successful_logins.txt` file contains tab-delimited entries for all successful default credential logins:
+The `successful_logins.txt` file contains backtick-delimited entries for all successful default credential logins:
 ```text
-# Format: AssetName	URI	Protocol	Port	Output
-10.10.62.21	10.10.62.21	tcp	443	Successful login with username 'admin' and blank password (HTTP 302)
-10.10.62.21	10.10.62.21	tcp	443	Successful login with username 'supervisor' and blank password (HTTP 302)
-10.10.62.22:8080	10.10.62.22:8080	tcp	8080	Successful login with username 'admin' and blank password (HTTP 302)
-192.168.1.50	192.168.1.50	tcp	80	Successful login with username 'admin' and blank password (HTTP 302)
+# Format: AssetName`URI`Protocol`Port`Output
+10.10.62.21`10.10.62.21`tcp`443`Successful login with username 'admin' and blank password (HTTP 302)
+10.10.62.21`10.10.62.21`tcp`443`Successful login with username 'supervisor' and blank password (HTTP 302)
+10.10.62.22:8080`10.10.62.22:8080`tcp`8080`Successful login with username 'admin' and blank password (HTTP 302)
+192.168.1.50`192.168.1.50`tcp`80`Successful login with username 'admin' and blank password (HTTP 302)
 ```
 
 **Format Details:**
+- **Delimiter**: Backtick (`) character
 - **AssetName**: The host/IP (matches EngagementAsset)
 - **URI**: The host/IP with optional port
 - **Protocol**: `tcp` (web services use TCP)

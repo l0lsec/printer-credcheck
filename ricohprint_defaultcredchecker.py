@@ -630,7 +630,7 @@ def parse_and_extract_names(output_dir: str = ".", output_file: str = "extracted
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Send default login POST requests to a list of hosts and report results."
+            "Test Ricoh printers for default credentials and export address books."
         )
     )
     parser.add_argument(
@@ -684,7 +684,7 @@ def main() -> int:
     parser.add_argument(
         "--success-file",
         default="successful_logins.txt",
-        help="Output file for successful logins in tab-delimited format (default: successful_logins.txt)",
+        help="Output file for successful logins in backtick-delimited format (default: successful_logins.txt)",
     )
 
     args = parser.parse_args()
@@ -831,14 +831,14 @@ def main() -> int:
         summary += f"\tEXPORTED: {exported}"
     print(summary)
     
-    # Write successful logins to tab-delimited file
+    # Write successful logins to backtick-delimited file
     if successful_logins:
         with open(args.success_file, "w", encoding="utf-8") as f:
             # Write header comment
-            f.write("# Format: AssetName\tURI\tProtocol\tPort\tOutput\n")
+            f.write("# Format: AssetName`URI`Protocol`Port`Output\n")
             # Write each successful login
             for asset_name, uri, protocol, port, output_msg in successful_logins:
-                f.write(f"{asset_name}\t{uri}\t{protocol}\t{port}\t{output_msg}\n")
+                f.write(f"{asset_name}`{uri}`{protocol}`{port}`{output_msg}\n")
         
         print(f"\nSuccessful logins saved to: {args.success_file} ({len(successful_logins)} entry/entries)")
     
