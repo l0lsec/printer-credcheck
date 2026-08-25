@@ -13,7 +13,7 @@ Supported today:
 | Vendor | Module | Default accounts tested | Address book export |
 |---|---|---|---|
 | Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin` | Not yet |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin` | Yes (CSV) |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -89,6 +89,33 @@ POST /login.html?/addressbook.html
 A `302` alone is not treated as proof. The module follows the redirect once with the new
 session cookie and confirms the page that comes back is not the login form again, so a device
 that redirects on failure cannot produce a false positive.
+
+### How the Sharp export works
+Sharp does not expose the address book as a data feed behind the list page. It ships a real
+export under **System Settings > Data Import/Export (CSV Format)**, which the module drives in
+three steps:
+
+```text
+GET  /sysmgt_storagebackup_csv.html        -> export form + token1/token2
+POST /sysmgt_storagebackup_csv.html
+     action=export_btn&ggt_radio(50)=33    (33 = Address Book, 23 = User Register Information)
+<-   302, Location: /storage_backup_csv.html?type=33
+GET  /storage_backup_csv.html?type=33      -> text/csv attachment
+```
+
+The CSV's first row names its columns, and the parser looks columns up by name rather than
+position because the set varies with firmware and with which destination types the device
+supports:
+
+```text
+"address","search-id","name","search-string","category-id","frequently-used","mail-address",
+"fax-number","ifax-address","ftp-host","ftp-directory","ftp-username","ftp-password",
+"smb-directory","smb-username",...
+```
+
+> **Handle the export carefully.** It is not just contacts. Scan-to-folder destinations bring
+> `ftp-host` / `ftp-username` / `ftp-password` and the SMB equivalents with them, so an
+> exported CSV can contain live service account credentials for internal file shares.
 
 > **Lockout note:** Sharp MFPs can be configured to lock an account after consecutive failed
 > logins ("A Warning when Login Fails", typically 3 attempts / 5 minutes). Each account in
@@ -167,9 +194,9 @@ python3 printer_credcheck.py 10.10.62.0/24 --show-skipped
 python3 printer_credcheck.py ./hosts.txt --vendor sharp
 ```
 
-#### Check credentials and export Ricoh address books
+#### Check credentials and export address books
 ```bash
-python3 printer_credcheck.py ./hosts.txt --vendor ricoh --export
+python3 printer_credcheck.py 10.10.62.0/24 --export --output-dir ./exports
 ```
 
 #### Try a non-default password list on Sharp devices
@@ -204,8 +231,9 @@ Successful logins are written to `--success-file` in backtick-delimited format:
 192.0.2.113`192.0.2.113`tcp`443`Successful Sharp MFP login with account 'Administrator' and password admin (HTTP 302)
 ```
 
-Exported Ricoh address books are saved as `addressbook_ricoh_<host>.txt`, and the parsed
-contacts land in `extracted_emails.txt` and `extracted_names.txt` in the output directory.
+Exported address books are saved per vendor - `addressbook_ricoh_<host>.txt` for Ricoh's
+array payload, `addressbook_sharp_<host>.csv` for Sharp's CSV - and the parsed contacts land
+in `extracted_emails.txt` and `extracted_names.txt` in the output directory.
 
 ### Adding a vendor
 1. Create `vendors/<vendor>.py` with a class that subclasses `PrinterModule` from `vendors/base.py`.
@@ -218,6 +246,8 @@ types plus the verbose logging and `Set-Cookie` parsing helpers, so a module onl
 describe the vendor's own request flow.
 
 ### Known gaps
-- **Sharp address book export** is not implemented. The credential check is complete, but
-  exporting needs a captured authenticated export request from a Sharp MFP (the UI page is
-  `/addressbook.html`; the underlying data request has not been captured yet).
+- **Sharp export is verified end to end, but only against an empty address book.** The device
+  it was built against reported `0 / 0` entries, so the request chain, the CSV headers, and
+  the file handling are confirmed against real firmware while row parsing is exercised only
+  by synthetic rows built on the device's own header. Worth a second look the first time it
+  runs against a populated device.

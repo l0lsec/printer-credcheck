@@ -1,6 +1,6 @@
 # Scan output - never commit results
 successful_logins.txt
-addressbook_*.txt
+addressbook_*
 extracted_emails.txt
 extracted_names.txt
 hosts.txt

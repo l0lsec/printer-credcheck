@@ -328,13 +328,11 @@ def main() -> int:
                       f"'{account.label}' cannot read the address book")
                 continue
 
-            export_host, export_result = module.export_address_book(result, ctx)
+            export_host, export_result, export_path = module.export_address_book(result, ctx)
             print(f"[{completed}/{len(jobs)}] {export_host}\tEXPORT: {export_result}")
-            if export_result.startswith("SUCCESS"):
+            if export_path:
                 exported += 1
-                exports_by_module.setdefault(module.name, []).append(
-                    export_result.split("Exported to ", 1)[-1]
-                )
+                exports_by_module.setdefault(module.name, []).append(export_path)
 
     summary = (f"\nEndpoints: {len(endpoints)}\tListening: {len(live)}\t"
                f"Printers: {len(identified)}\tSkipped: {skipped}"

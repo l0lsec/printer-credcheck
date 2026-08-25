@@ -13,7 +13,7 @@ checker; only the packaging moved.
 import ast
 import base64
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from requests.exceptions import RequestException
@@ -193,11 +193,12 @@ class RicohModule(PrinterModule):
         return result
 
     # ---- export --------------------------------------------------------
-    def export_address_book(self, result: LoginResult, ctx: ScanContext) -> Tuple[str, str]:
+    def export_address_book(self, result: LoginResult,
+                            ctx: ScanContext) -> Tuple[str, str, Optional[str]]:
         hostport = result.target.hostport
         session = result.session or {}
         if "cookies" not in session:
-            return hostport, "ERROR: No session data available"
+            return hostport, "ERROR: No session data available", None
 
         base_url = session.get("base_url", result.target.base_url)
         session_cookies: Dict[str, str] = dict(session.get("cookies", {}))
@@ -230,12 +231,12 @@ class RicohModule(PrinterModule):
             adrs_resp = http_get(adrs_url, ctx, headers=adrs_headers,
                                  cookies=adrs_cookies, timeout=ctx.export_timeout)
         except RequestException as exc:
-            return hostport, f"ERROR: Address list request failed - {exc.__class__.__name__}: {exc}"
+            return hostport, f"ERROR: Address list request failed - {exc.__class__.__name__}: {exc}", None
 
         log_response(ctx, "ADDRESS LIST RESPONSE", hostport, adrs_resp, body_limit=500)
 
         if adrs_resp.status_code != 200:
-            return hostport, f"ERROR: Address list request failed with HTTP {adrs_resp.status_code}"
+            return hostport, f"ERROR: Address list request failed with HTTP {adrs_resp.status_code}", None
 
         fresh = parse_set_cookies(adrs_resp).get("risessionid")
         if fresh:
@@ -265,18 +266,18 @@ class RicohModule(PrinterModule):
             resp = http_get(url, ctx, headers=headers, cookies=session_cookies,
                             timeout=ctx.export_timeout, max_bytes=16 * 1024 * 1024)
         except RequestException as exc:
-            return hostport, f"ERROR: Export failed - {exc.__class__.__name__}: {exc}"
+            return hostport, f"ERROR: Export failed - {exc.__class__.__name__}: {exc}", None
 
         log_response(ctx, "EXPORT RESPONSE", hostport, resp, body_limit=1000)
 
         if resp.status_code != 200:
-            return hostport, f"ERROR: Export failed with HTTP {resp.status_code}"
+            return hostport, f"ERROR: Export failed with HTTP {resp.status_code}", None
 
         safe_filename = hostport.replace(":", "_").replace("/", "_")
         output_file = f"{ctx.output_dir}/addressbook_{self.name}_{safe_filename}.txt"
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(resp.text)
-        return hostport, f"SUCCESS: Exported to {output_file}"
+        return hostport, f"SUCCESS: Exported to {output_file}", output_file
 
     # ---- contact extraction --------------------------------------------
     def extract_contacts(self, text: str) -> Tuple[List[str], List[str]]:

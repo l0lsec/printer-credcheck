@@ -98,9 +98,13 @@ class PrinterModule:
         raise NotImplementedError
 
     # ---- optional ------------------------------------------------------
-    def export_address_book(self, result: LoginResult, ctx: ScanContext) -> Tuple[str, str]:
-        """Return (hostport, result_message)."""
-        return result.target.hostport, "ERROR: export not supported for this vendor"
+    def export_address_book(self, result: LoginResult,
+                            ctx: ScanContext) -> Tuple[str, str, Optional[str]]:
+        """
+        Return (hostport, result_message, saved_path). saved_path is None when
+        nothing was written, so callers never have to parse the message.
+        """
+        return result.target.hostport, "ERROR: export not supported for this vendor", None
 
     def extract_contacts(self, text: str) -> Tuple[List[str], List[str]]:
         """Return (emails, names) parsed out of an exported address book."""

