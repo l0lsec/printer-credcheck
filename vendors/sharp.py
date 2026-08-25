@@ -81,7 +81,23 @@ _TABLE_RE = re.compile(r"<table[^>]*>(.*?)</table>", re.S | re.I)
 _ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
 _CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t\1>", re.S | re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
+# Each row carries the entry's member id, both as a hidden field and as the
+# middle field of the checkbox value ("<index>,<memberid>,<name>"). It is the
+# only reliable identity: two distinct contacts can share a name and an address.
+_ROW_ID_RE = re.compile(r"addressbook_adrlistprofid\((\d+)\)", re.I)
+_ROW_ID_ALT_RE = re.compile(r'value="\d+,(\d+),', re.I)
 _TOTAL_RE = re.compile(r"Total\s+Address\w*\s*:?\s*(\d+)", re.I)
+# "Total Address: 81   1 / 9" -> total, current page, page count
+_PAGE_RE = re.compile(r"Total\s+Address\w*\s*:?\s*(\d+)\s+(\d+)\s*/\s*(\d+)", re.I)
+_LIST_FORM = "adrbook"
+PAGE_SIZE_FIELD = "ggt_select(9)"       # "Display Items": 10 / 20 / 50 / 100
+# Every control on the list page submits the same form, and the device decides
+# what to do from `action`, which the page's own validate() sets to the name of
+# whichever control fired. So paging is action=nextbtn, and changing the page
+# size is action=ggt_select(9) - not action=updatebtn.
+NEXT_ACTION = "nextbtn"
+# Safety net for the page walk: no address book should need more than this.
+MAX_PAGE_WALK = 200
 # What Sharp renders in a cell that holds nothing - including the single
 # placeholder row an empty address book still draws.
 _PLACEHOLDERS = {"", "-", "--", "------", "not set", "none"}
@@ -93,17 +109,71 @@ def _cell_text(raw: str) -> str:
     return " ".join(text.replace("\xa0", " ").split())
 
 
-def parse_address_table(page: str) -> List[Tuple[str, str]]:
+def read_pagination(page: str) -> Tuple[Optional[int], int, int]:
+    """Return (total_entries, current_page, page_count) from the list header."""
+    flat = html_module.unescape(_TAG_RE.sub(" ", page or ""))
+    paged = _PAGE_RE.search(flat)
+    if paged:
+        return int(paged.group(1)), int(paged.group(2)), int(paged.group(3))
+    total = _TOTAL_RE.search(flat)
+    return (int(total.group(1)) if total else None), 1, 1
+
+
+def list_form_state(page: str) -> Dict[str, str]:
     """
-    Pull (name, email) out of the address book table.
+    Rebuild the address book form's current state: hidden fields plus whichever
+    option each <select> currently has selected. Per-row profile id fields are
+    dropped - they describe the rows on screen, not the query.
+    """
+    body = _form_block(page or "", _LIST_FORM)
+    if body is None:
+        return {}
+    state: Dict[str, str] = {}
+    for blob in _INPUT_RE.findall(body):
+        attrs = _attrs(blob)
+        name = attrs.get("name")
+        if not name or attrs.get("type", "").lower() != "hidden":
+            continue
+        if name.startswith("addressbook_adrlistprofid"):
+            continue
+        state[name] = attrs.get("value", "")
+    for name, inner in _SELECT_RE.findall(body):
+        selected = [value for value, flags, _text in _OPTION_RE.findall(inner) if "selected" in flags]
+        options = _OPTION_RE.findall(inner)
+        state[name] = selected[0] if selected else (options[0][0] if options else "")
+    return state
+
+
+def largest_page_size(page: str) -> Optional[str]:
+    """The form value behind the biggest "Display Items" option (usually 100)."""
+    body = _form_block(page or "", _LIST_FORM)
+    if body is None:
+        return None
+    for name, inner in _SELECT_RE.findall(body):
+        if name != PAGE_SIZE_FIELD:
+            continue
+        best_value, best_size = None, -1
+        for value, _flags, text in _OPTION_RE.findall(inner):
+            digits = re.sub(r"\D", "", text)
+            if digits and int(digits) > best_size:
+                best_value, best_size = value, int(digits)
+        return best_value
+    return None
+
+
+def parse_address_table(page: str) -> List[Tuple[str, str, str]]:
+    """
+    Pull (name, email, row_id) out of the address book table.
 
     Columns are located from the header row rather than assumed by position -
     the visible set varies by model and by which destination types are in use.
+    row_id is the device's member id where the row exposes one, which is what
+    makes de-duplication across pages safe.
     """
     for table in _TABLE_RE.findall(page or ""):
         name_col: Optional[int] = None
         mail_col: Optional[int] = None
-        entries: List[Tuple[str, str]] = []
+        entries: List[Tuple[str, str, str]] = []
 
         for row in _ROW_RE.findall(table):
             cells = _CELL_RE.findall(row)
@@ -129,8 +199,13 @@ def parse_address_table(page: str) -> List[Tuple[str, str]]:
                     email = candidate
             if name.lower() in _PLACEHOLDERS and not email:
                 continue
-            if name or email:
-                entries.append((name, email))
+            if not (name or email):
+                continue
+            row_id = ""
+            found = _ROW_ID_RE.search(row) or _ROW_ID_ALT_RE.search(row)
+            if found:
+                row_id = found.group(1)
+            entries.append((name, email, row_id or f"pos:{len(entries)}:{name}:{email}"))
 
         if entries:
             return entries
@@ -515,25 +590,114 @@ class SharpModule(PrinterModule):
         if PASSWORD_FIELD in body or page_title(body).lower().startswith("login"):
             return [], [], "SKIPPED: address book requires authentication"
 
-        total_match = _TOTAL_RE.search(html_module.unescape(_TAG_RE.sub(" ", body)))
-        total = int(total_match.group(1)) if total_match else None
+        # Keep the device's session so page state survives across requests.
+        cookies = dict(cookies)
+        for name, value in parse_set_cookies(resp).items():
+            cookies.setdefault(name, value)
 
+        total, page, pages = read_pagination(body)
         entries = parse_address_table(body)
         if total == 0 or not entries:
             return [], [], "No address book entries on this device"
 
-        emails = [email for _name, email in entries if email]
-        names = [name for name, _email in entries if name]
+        collected: List[Tuple[str, str, str]] = []
+        seen = set()
+        for row in entries:
+            if row[2] not in seen:
+                seen.add(row[2])
+                collected.append(row)
+
+        # Widen the page before walking it - one request for 100 rows beats ten
+        # requests for 10. The page size is a form control like any other, so
+        # this works unauthenticated too.
+        if total is not None and len(collected) < total and pages > 1:
+            biggest = largest_page_size(body)
+            if biggest:
+                widened = self._post_list(url, cookies, ctx, body, headers,
+                                          action=PAGE_SIZE_FIELD,
+                                          overrides={PAGE_SIZE_FIELD: biggest})
+                if widened:
+                    rows = parse_address_table(widened)
+                    if len(rows) > len(collected):
+                        body = widened
+                        total, page, pages = read_pagination(body)
+                        collected, seen = [], set()
+                        for row in rows:
+                            if row[2] not in seen:
+                                seen.add(row[2])
+                                collected.append(row)
+
+        # Walk whatever is left with the Next button.
+        walked = 0
+        while (total is not None and len(collected) < total and page < pages
+               and walked < MAX_PAGE_WALK):
+            walked += 1
+            next_body = self._post_list(url, cookies, ctx, body, headers, action=NEXT_ACTION)
+            if not next_body:
+                break
+            next_total, next_page, next_pages = read_pagination(next_body)
+            if next_page == page:
+                break                      # the device did not advance; stop rather than loop
+            body, page, pages = next_body, next_page, next_pages
+            if next_total is not None:
+                total = next_total
+            for row in parse_address_table(body):
+                if row[2] not in seen:
+                    seen.add(row[2])
+                    collected.append(row)
+
+        emails = [email for _name, email, _row_id in collected if email]
+        names = [name for name, _email, _row_id in collected if name]
 
         if total is None:
-            message = f"SUCCESS: Harvested {len(entries)} entry/entries"
-        elif len(entries) < total:
-            message = (f"PARTIAL: Harvested {len(entries)} of {total} entry/entries - the "
-                       f"device paginates and the page size cannot be raised without an "
-                       f"admin session")
+            message = f"SUCCESS: Harvested {len(collected)} entry/entries"
+        elif len(collected) < total:
+            message = (f"PARTIAL: Harvested {len(collected)} of {total} entry/entries "
+                       f"(stopped on page {page} of {pages})")
         else:
-            message = f"SUCCESS: Harvested {len(entries)} of {total} entry/entries"
+            message = f"SUCCESS: Harvested {len(collected)} of {total} entry/entries"
         return emails, names, message
+
+    def _post_list(self, url: str, cookies: Dict, ctx: ScanContext, page_html: str,
+                   headers: Dict, action: str,
+                   overrides: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """
+        Re-submit the address book form the way the page's own validate() does:
+        every current field, plus `action` naming the control that fired. The
+        CSRF token is re-read from the page being submitted, since it is
+        single use.
+        """
+        data = list_form_state(page_html)
+        if not data:
+            return None
+        if overrides:
+            data.update(overrides)
+        data["action"] = action
+        data["ordinate"] = "0"
+
+        post_headers = dict(headers)
+        post_headers.update({
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": url.rsplit("/", 1)[0],
+            "Referer": url,
+        })
+        try:
+            resp = http_post(url, ctx, headers=post_headers, cookies=cookies, data=data,
+                             allow_redirects=False, timeout=ctx.export_timeout,
+                             max_bytes=16 * 1024 * 1024)
+            if resp.status_code == 302:
+                location = resp.headers.get("Location", "")
+                if not location:
+                    return None
+                target = location if location.startswith("http") else url.rsplit("/", 1)[0] + location
+                resp = http_get(target, ctx, headers=headers, cookies=cookies,
+                                allow_redirects=False, timeout=ctx.export_timeout,
+                                max_bytes=16 * 1024 * 1024)
+        except RequestException:
+            return None
+        if resp.status_code != 200:
+            return None
+        return resp.text or ""
 
     # ---- contact extraction --------------------------------------------
     def extract_contacts(self, text: str) -> Tuple[List[str], List[str]]:

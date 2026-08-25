@@ -132,10 +132,30 @@ default credentials work  -> CSV export via System Settings (complete, includes 
 default credentials fail  -> scrape /addressbook.html    (names + e-mail addresses only)
 ```
 
-The one limit worth knowing: the page-size control is an administrative setting, so an
-anonymous read gets a single page of up to 50 entries. The module reads the device's own
-`Total Address` count and reports `PARTIAL: Harvested 50 of 137 ...` rather than quietly
-returning a truncated list, so a short read is always visible.
+#### Pagination
+The list page shows 10-50 entries at a time, so anything larger has to be paged. Every control
+on that page submits the same form and the device decides what to do from the `action` field,
+which the page's own `validate()` sets to *the name of whichever control fired*. That is the
+whole trick:
+
+| Intent | Field to send |
+|---|---|
+| Change page size | `action=ggt_select(9)` with `ggt_select(9)=<option value>` |
+| Next page | `action=nextbtn` |
+| Previous page | `action=prevbtn` |
+
+Sending `action=updatebtn` — the obvious guess — is silently ignored.
+
+The harvester widens the page to the largest offered size first, since one request for 100
+rows beats ten requests for 10, then walks any remainder with `nextbtn`. The CSRF token is
+single use, so it is re-read from each page before submitting the next, and the device's
+session cookie is carried throughout because paging state lives server side. None of this
+needs a login.
+
+Rows are de-duplicated on the device's own member id rather than on name and address: two
+distinct contacts can legitimately share both. The module reads the device's `Total Address`
+count and reports `PARTIAL: Harvested 50 of 137 (stopped on page 2 of 4)` if it ever falls
+short, so a truncated read is never silent.
 
 > **Lockout note:** Sharp MFPs can be configured to lock an account after consecutive failed
 > logins ("A Warning when Login Fails", typically 3 attempts / 5 minutes). Each account in
