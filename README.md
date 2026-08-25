@@ -10,10 +10,10 @@ unrelated HTTP services on the range are identified and skipped rather than logg
 
 Supported today:
 
-| Vendor | Module | Default accounts tested | Address book export |
-|---|---|---|---|
-| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin` | Yes (CSV) |
+| Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest |
+|---|---|---|---|---|
+| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin` | Yes (CSV) | Yes |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -28,7 +28,10 @@ Supported today:
 - **Credential testing**: checks whether devices still carry their factory default logins
 - **Successful login export**: writes all successful logins to a backtick-delimited file
 - **Address book export**: pulls address books from vulnerable devices (supported vendors)
-- **Email & name extraction**: parses exported address books into email and name lists
+- **Unauthenticated harvest**: when default credentials fail, still reads whatever contacts the
+  device exposes without a login
+- **Email, name & username extraction**: parses everything harvested into email, name, and
+  username lists
 - **Real-time progress**: prints each result as it completes
 - **Concurrent scanning**: multi-threaded across hosts
 - **Verbose mode**: full HTTP request/response tracing for debugging
@@ -117,6 +120,23 @@ supports:
 > `ftp-host` / `ftp-username` / `ftp-password` and the SMB equivalents with them, so an
 > exported CSV can contain live service account credentials for internal file shares.
 
+### Harvesting without a login
+Changing the administrator password does not necessarily protect the address book. On the
+Sharp MFPs tested, `/addressbook.html` renders the full contact table - names and e-mail
+addresses - to anonymous visitors, with only the *Login* button hinting that no session
+exists. `--export` therefore falls back to reading that page whenever a device's default
+credentials have been changed:
+
+```text
+default credentials work  -> CSV export via System Settings (complete, includes FTP/SMB creds)
+default credentials fail  -> scrape /addressbook.html    (names + e-mail addresses only)
+```
+
+The one limit worth knowing: the page-size control is an administrative setting, so an
+anonymous read gets a single page of up to 50 entries. The module reads the device's own
+`Total Address` count and reports `PARTIAL: Harvested 50 of 137 ...` rather than quietly
+returning a truncated list, so a short read is always visible.
+
 > **Lockout note:** Sharp MFPs can be configured to lock an account after consecutive failed
 > logins ("A Warning when Login Fails", typically 3 attempts / 5 minutes). Each account in
 > `--accounts` costs one attempt per host, so keep the list short on production fleets.
@@ -194,7 +214,7 @@ python3 printer_credcheck.py 10.10.62.0/24 --show-skipped
 python3 printer_credcheck.py ./hosts.txt --vendor sharp
 ```
 
-#### Check credentials and export address books
+#### Check credentials and harvest address books, usernames included
 ```bash
 python3 printer_credcheck.py 10.10.62.0/24 --export --output-dir ./exports
 ```
@@ -216,10 +236,12 @@ python3 printer_credcheck.py ./hosts.txt --scheme http --verbose
 
 ### Output
 
-The scan runs in three stages:
+The scan runs in four stages:
 1. **Step 1** — expand the targets and port sweep them for listening HTTP services
 2. **Step 2** — fingerprint every live service and assign it to a vendor module (or skip it)
-3. **Step 3** — test that vendor's default accounts, then export where supported
+3. **Step 3** — test that vendor's default accounts
+4. **Step 4** — harvest address books, by export where the credentials worked and by
+   unauthenticated read where they did not
 
 Skipped endpoints are counted rather than listed; pass `--show-skipped` to see each one and
 the reason every module rejected it.
@@ -232,13 +254,22 @@ Successful logins are written to `--success-file` in backtick-delimited format:
 ```
 
 Exported address books are saved per vendor - `addressbook_ricoh_<host>.txt` for Ricoh's
-array payload, `addressbook_sharp_<host>.csv` for Sharp's CSV - and the parsed contacts land
-in `extracted_emails.txt` and `extracted_names.txt` in the output directory.
+array payload, `addressbook_sharp_<host>.csv` for Sharp's CSV. Everything harvested across the
+whole run, exports and unauthenticated reads alike, is pooled into three de-duplicated files
+in the output directory:
+
+| File | Contents |
+|---|---|
+| `extracted_emails.txt` | every e-mail address found |
+| `extracted_names.txt` | every address book display name |
+| `extracted_usernames.txt` | the local part of each address, lowercased - `j.doe@corp.example` becomes `j.doe` |
 
 ### Adding a vendor
 1. Create `vendors/<vendor>.py` with a class that subclasses `PrinterModule` from `vendors/base.py`.
 2. Implement `fingerprint()` and `attempt_login()`. Implement `export_address_book()` and
-   `extract_contacts()` too if you have a captured export request, and set `supports_export = True`.
+   `extract_contacts()` too if you have a captured export request, and set
+   `supports_export = True`. If the device leaks contacts without a session, implement
+   `scrape_contacts()` and set `supports_scrape = True`.
 3. Register the class in `MODULES` in `vendors/__init__.py`.
 
 `vendors/base.py` supplies the shared `Target` / `Account` / `ScanContext` / `LoginResult`

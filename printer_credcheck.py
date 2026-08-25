@@ -64,30 +64,37 @@ def identify(target: Target, modules: List[PrinterModule],
     return target, None, "; ".join(reasons)
 
 
-def run_extraction(module: PrinterModule, files: List[str], output_dir: str) -> None:
-    emails, names = set(), set()
-    for path in files:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except OSError as exc:
-            print(f"Warning: Failed to read {path}: {exc}")
+def usernames_from_emails(emails) -> List[str]:
+    """
+    Derive login names from harvested addresses: the local part of each mailbox,
+    lowercased and de-duplicated. jane.doe@corp.example -> jane.doe
+    """
+    usernames = set()
+    for email in emails:
+        if "@" not in email:
             continue
-        found_emails, found_names = module.extract_contacts(content)
-        emails.update(e for e in found_emails if e)
-        names.update(n for n in found_names if n)
+        local = email.split("@", 1)[0].strip().lower()
+        if local:
+            usernames.add(local)
+    return sorted(usernames)
 
-    for label, values, filename in (
-        ("email", sorted(emails), "extracted_emails.txt"),
-        ("name", sorted(names), "extracted_names.txt"),
-    ):
-        if not values:
-            continue
-        out_path = os.path.join(output_dir, filename)
-        with open(out_path, "w", encoding="utf-8") as f:
-            for value in values:
-                f.write(f"{value}\n")
-        print(f"Extracted {len(values)} unique {label}(s) to {out_path}")
+
+def read_export(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError as exc:
+        print(f"Warning: Failed to read {path}: {exc}")
+        return ""
+
+
+def write_lines(path: str, values: List[str], label: str) -> None:
+    if not values:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        for value in values:
+            f.write(f"{value}\n")
+    print(f"Extracted {len(values)} unique {label}(s) to {path}")
 
 
 def main() -> int:
@@ -126,8 +133,9 @@ def main() -> int:
     parser.add_argument("--verify", action="store_true",
                         help="Verify TLS certificates (default: disabled)")
     parser.add_argument("--export", action="store_true",
-                        help="Export address books from printers with default credentials "
-                             "(supported vendors only)")
+                        help="Harvest address books: export them where default credentials "
+                             "work, otherwise read whatever the device exposes without a "
+                             "login. Writes emails, names, and usernames.")
     parser.add_argument("--output-dir", default=".",
                         help="Output directory for exported address books (default: current directory)")
     parser.add_argument("--export-timeout", type=int, default=30,
@@ -273,10 +281,10 @@ def main() -> int:
     print(f"Total credential tests: {len(jobs)}")
     print("-" * 80)
 
-    successes = failures = errors = exported = 0
+    successes = failures = errors = exported = harvested = 0
     completed = 0
     successful_logins: List[Tuple[str, str, str, str, str]] = []
-    exports_by_module: Dict[str, List[str]] = {}
+    success_by_host: Dict[str, LoginResult] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
@@ -316,29 +324,57 @@ def main() -> int:
             successful_logins.append(
                 (target.hostport, target.hostport, "tcp", target.port, output_msg)
             )
+            # Keep the most capable session per host for the harvest stage.
+            existing = success_by_host.get(target.hostport)
+            if existing is None or (account.can_export and not existing.account.can_export):
+                success_by_host[target.hostport] = result
 
-            if not args.export:
-                continue
-            if not module.supports_export:
-                print(f"[{completed}/{len(jobs)}] {target.hostport}\tEXPORT: SKIPPED - "
-                      f"{module.export_note or 'not supported for ' + module.name}")
-                continue
-            if not account.can_export:
-                print(f"[{completed}/{len(jobs)}] {target.hostport}\tEXPORT: SKIPPED - "
-                      f"'{account.label}' cannot read the address book")
-                continue
+    # ---- Stage 4: harvest address books --------------------------------
+    all_emails: List[str] = []
+    all_names: List[str] = []
 
-            export_host, export_result, export_path = module.export_address_book(result, ctx)
-            print(f"[{completed}/{len(jobs)}] {export_host}\tEXPORT: {export_result}")
-            if export_path:
-                exported += 1
-                exports_by_module.setdefault(module.name, []).append(export_path)
+    if args.export:
+        print(f"\n{'-' * 80}")
+        print(f"Step 4: Harvesting address books from {len(identified)} printer(s)")
+        print("-" * 80)
+
+        for target, module in identified:
+            login = success_by_host.get(target.hostport)
+            path = None
+
+            # Preferred route: a real export, if we got in and the account allows it.
+            if login and module.supports_export and login.account.can_export:
+                _host, message, path = module.export_address_book(login, ctx)
+                print(f"{target.hostport}\tEXPORT: {message}")
+                if path:
+                    exported += 1
+                    emails, names = module.extract_contacts(read_export(path))
+                    all_emails.extend(emails)
+                    all_names.extend(names)
+
+            # Fallback: read whatever the device shows without an export. Many
+            # Sharp MFPs render their whole address book to anonymous visitors,
+            # so this still produces contacts on devices whose default
+            # credentials have been changed.
+            if not path:
+                if not module.supports_scrape:
+                    if not login:
+                        print(f"{target.hostport}\tHARVEST: SKIPPED - no default credentials "
+                              f"and no unauthenticated harvest for {module.name}")
+                    continue
+                session = login.session if login else None
+                emails, names, message = module.scrape_contacts(target, ctx, session)
+                print(f"{target.hostport}\tHARVEST: {message}")
+                all_emails.extend(emails)
+                all_names.extend(names)
+                if emails or names:
+                    harvested += 1
 
     summary = (f"\nEndpoints: {len(endpoints)}\tListening: {len(live)}\t"
                f"Printers: {len(identified)}\tSkipped: {skipped}"
                f"\nCredential Tests: {len(jobs)}\tSUCCESS: {successes}\tFAIL: {failures}\tERROR: {errors}")
     if args.export:
-        summary += f"\tEXPORTED: {exported}"
+        summary += f"\tEXPORTED: {exported}\tHARVESTED: {harvested}"
     print(summary)
 
     if successful_logins:
@@ -349,10 +385,14 @@ def main() -> int:
         print(f"\nSuccessful logins saved to: {args.success_file} "
               f"({len(successful_logins)} entry/entries)")
 
-    for module_name, files in exports_by_module.items():
-        module = vendors.get(module_name)
-        print(f"\nExtracting contacts from {len(files)} {module_name} address book(s)...")
-        run_extraction(module, files, args.output_dir)
+    if args.export and (all_emails or all_names):
+        emails = sorted(set(all_emails))
+        names = sorted(set(all_names))
+        usernames = usernames_from_emails(emails)
+        print()
+        write_lines(os.path.join(args.output_dir, "extracted_emails.txt"), emails, "email")
+        write_lines(os.path.join(args.output_dir, "extracted_names.txt"), names, "name")
+        write_lines(os.path.join(args.output_dir, "extracted_usernames.txt"), usernames, "username")
 
     return 0 if successes or failures else 1
 

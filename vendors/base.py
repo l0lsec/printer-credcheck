@@ -87,6 +87,7 @@ class PrinterModule:
     display_name = "Generic printer"
     default_accounts: List[Account] = []
     supports_export = False
+    supports_scrape = False
     export_note = ""
 
     # ---- required ------------------------------------------------------
@@ -109,6 +110,17 @@ class PrinterModule:
     def extract_contacts(self, text: str) -> Tuple[List[str], List[str]]:
         """Return (emails, names) parsed out of an exported address book."""
         return [], []
+
+    def scrape_contacts(self, target: Target, ctx: ScanContext,
+                        session: Optional[Dict] = None) -> Tuple[List[str], List[str], str]:
+        """
+        Harvest contacts from pages the device exposes without an export.
+
+        This is the fallback for devices whose default credentials have been
+        changed: many printers still render their address book to anonymous
+        visitors. Returns (emails, names, message).
+        """
+        return [], [], "SKIPPED: contact scraping not supported for this vendor"
 
     def accounts(self, override: Optional[List[Account]] = None) -> List[Account]:
         return override if override else list(self.default_accounts)

