@@ -1,41 +1,113 @@
-## ricohprint_defaultcredchecker.py
+## printer-credcheck
 
 ### Overview
-This script tests Ricoh printers for default credentials (admin and supervisor with empty passwords) by sending authenticated web login requests. It can also export address books from printers with successful default admin credentials.
+Tests network printers and MFPs for vendor default credentials, and exports address books
+from devices that still have them. Point it at a host, a file of hosts, or a whole subnet.
+
+The tool is vendor-agnostic: each printer family lives in its own module under `vendors/`.
+Every endpoint is port probed and fingerprinted before a single credential is sent, so
+unrelated HTTP services on the range are identified and skipped rather than logged into.
+
+Supported today:
+
+| Vendor | Module | Default accounts tested | Address book export |
+|---|---|---|---|
+| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin` | Not yet |
 
 ### Features
-- **Ricoh Printer Detection**: Pre-checks each host to verify it's a Ricoh printer before testing credentials (reduces false positives)
-- **Credential Testing**: Checks if printers still use default admin and supervisor credentials
-- **Successful Login Export**: Automatically saves all successful logins to a backtick-delimited file
-- **Address Book Export**: Automatically exports address books from vulnerable printers (admin account only)
-- **Email & Name Extraction**: Automatically parses exported address books and extracts all emails and names
-- **Real-Time Progress**: Shows progress counter as tests complete
-- **Concurrent Scanning**: Multi-threaded for fast scanning of multiple devices
-- **Verbose Mode**: Detailed debugging output showing all HTTP requests/responses
+- **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
+  containing any mix of those
+- **HTTP service discovery**: sweeps a port list with a TCP connect plus a TLS handshake, so
+  it finds printer web UIs on non-standard ports and knows whether to speak http or https
+- **Safe on mixed ranges**: anything that is not a supported printer is skipped without ever
+  receiving a credential, and a service that hangs, floods, or errors cannot break the scan
+- **Vendor fingerprinting**: every host is identified before any credential is sent, which
+  keeps devices that accept any username/password out of the results
+- **Auto-detection**: `--vendor auto` (the default) tries each module until one claims the host
+- **Credential testing**: checks whether devices still carry their factory default logins
+- **Successful login export**: writes all successful logins to a backtick-delimited file
+- **Address book export**: pulls address books from vulnerable devices (supported vendors)
+- **Email & name extraction**: parses exported address books into email and name lists
+- **Real-time progress**: prints each result as it completes
+- **Concurrent scanning**: multi-threaded across hosts
+- **Verbose mode**: full HTTP request/response tracing for debugging
 
-### Default Accounts Tested
-- **admin** (with blank password) - Can export address books if successful
-- **supervisor** (with blank password) - Cannot export address books (limited privileges)
+### How scanning works
 
-### How Ricoh Detection Works
-To minimize false positives, the script first verifies each host is a Ricoh printer by:
-1. Sending a GET request to `/web/guest/en/websys/webArch/mainFrame.cgi`
-2. Checking for Ricoh-specific indicators in the response:
-   - "RICOH" in the page content
-   - "Web Image Monitor" (Ricoh's web interface name)
-   - Ricoh-specific paths like `websys/webArch`, `/web/guest/`
-   - Redirects to authentication pages like `authForm.cgi`
-3. Only testing credentials on devices that pass this verification
+1. **Expand** — target specs become concrete `scheme://host:port` endpoints. A URL or an
+   explicit `host:port` is taken literally; bare hosts, CIDRs, and ranges are multiplied
+   across `--ports`.
+2. **Probe** — each endpoint gets a TCP connect followed by a TLS handshake attempt. That is
+   far cheaper than an HTTP request and it decides http vs https per port, so a printer UI on
+   an odd port is still spoken to correctly. Closed ports never reach stage 3.
+3. **Fingerprint** — every listening service is matched against the enabled vendor modules.
+   Only a positive match moves on.
+4. **Test credentials** — the matched vendor's default accounts, and nothing else.
 
-This prevents testing credentials on non-Ricoh devices that might accept any username/password (causing false positives).
+Response bodies are read through a 512 KB ceiling, so pointing the scanner at a file server
+or a streaming endpoint cannot exhaust memory or stall a worker. A module that raises on a
+strange endpoint is contained and the scan continues.
 
-### Hosts file format
-Provide one host or URL per line. Lines beginning with `#` and blank lines are ignored.
-- Can be an IP/hostname (e.g., `10.10.62.20`)
-- Can include a port (e.g., `10.10.62.22:8443`)
-- Can be a full URL (e.g., `https://10.10.62.21`)
+### How detection works
 
-Example file:
+**Ricoh** — `GET /web/guest/en/websys/webArch/mainFrame.cgi` and look for `RICOH`,
+`Web Image Monitor`, `rimNote`, `rimLocal`, or a redirect to `authForm.cgi`. The path-shaped
+markers (`websys/webArch`, `/web/guest/`) only count after any echo of the request URL has
+been stripped from the response — otherwise any server that quotes your request back at you,
+such as a proxy error page or a 404 handler, fingerprints as a Ricoh. For the same reason a
+bare `HTTP 200` on the login POST is not treated as a successful login unless the response
+actually looks like Web Image Monitor or the device issued a session cookie.
+
+**Sharp** — `GET /login.html` and look for the proprietary `Extend-sharp-*` response header
+or an `MFPSESSIONID` cookie (either is conclusive on its own), backed up by
+`Server: Rapid Logic`, the `ggt_textbox(...)` / `ggt_select(...)` form fields, and a
+`Login - <MODEL>` page title. `Rapid Logic` never counts on its own — it is a generic
+embedded web server shipped in plenty of non-Sharp gear.
+
+### How the Sharp login works
+Sharp's web login differs from Ricoh's in two ways that the module handles:
+
+1. **The login name is a dropdown, not a text box.** On a device in administrator-authority
+   mode the `ggt_select(10009)` select holds a single option, `Administrator` (value `3`).
+   Devices running user authentication instead expose a free-text `ggt_textbox(10002)` field,
+   which the module fills in when it is present.
+2. **Every login form carries a one-shot CSRF token.** `token2` has to be scraped from the
+   form and posted back on the same `MFPSESSIONID` session; a replayed token is rejected.
+
+The resulting exchange:
+
+```text
+GET  /login.html?/addressbook.html      -> 200, login form + token2 + MFPSESSIONID
+POST /login.html?/addressbook.html
+     ggt_select(10009)=3&ggt_textbox(10003)=<password>&action=loginbtn
+     &token2=<per-session>&ordinate=0&ggt_hidden(10008)=5
+<-   302, Location: /addressbook.html, fresh MFPSESSIONID   (success)
+<-   200, login form re-rendered                            (failure)
+```
+
+A `302` alone is not treated as proof. The module follows the redirect once with the new
+session cookie and confirms the page that comes back is not the login form again, so a device
+that redirects on failure cannot produce a false positive.
+
+> **Lockout note:** Sharp MFPs can be configured to lock an account after consecutive failed
+> logins ("A Warning when Login Fails", typically 3 attempts / 5 minutes). Each account in
+> `--accounts` costs one attempt per host, so keep the list short on production fleets.
+
+### Target formats
+Targets can be given on the command line, in a file, or both:
+
+| Form | Example | Behaviour |
+|---|---|---|
+| CIDR block | `10.10.62.0/24` | every host, swept across `--ports` |
+| Address range | `10.10.62.1-50` or `10.10.62.1-10.10.62.50` | every host, swept across `--ports` |
+| Bare host | `10.10.62.20` | swept across `--ports` |
+| Host with port | `10.10.62.22:8443` | taken literally, port not multiplied |
+| Full URL | `https://10.10.62.21` | taken literally, scheme honoured |
+| File | `./hosts.txt` | one spec per line, any of the above |
+
+A file uses one spec per line; blank lines and lines beginning with `#` are ignored.
+
 ```text
 # Staging devices
 10.10.62.20
@@ -45,333 +117,107 @@ https://10.10.62.21
 
 ### Usage
 ```bash
-python3 ricohprint_defaultcredchecker.py /path/to/hosts.txt [OPTIONS]
+python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 ```
 
 #### Arguments
-- `hosts_file`: Path to the file with hosts/URLs (one per line)
-- `--scheme {http,https}`: Default scheme if a line omits it (default: `https`)
-- `--timeout <int>`: Request timeout in seconds for login requests (default: `10`)
-- `--workers <int>`: Number of concurrent workers (default: `10`)
-- `--verify`: Enable TLS certificate verification (disabled by default)
-- `--export`: Export address books from printers with successful default credentials
-- `--output-dir <path>`: Output directory for exported address books (default: current directory)
-- `--export-timeout <int>`: Timeout in seconds for address book export requests (default: `30`)
-- `--success-file <path>`: Output file for successful logins in backtick-delimited format (default: `successful_logins.txt`)
-- `--verbose`: Enable verbose output showing all HTTP requests and responses
+- `targets`: one or more hosts, CIDR blocks, ranges, URLs, or files of targets
+- `--vendor <list>`: comma-separated vendors to test, or `auto` to fingerprint each host (default: `auto`)
+- `--list-vendors`: list supported vendors and their default accounts, then exit
+- `--accounts <pairs>`: override the accounts tested, as `user:pass` pairs (e.g. `admin:,supervisor:`)
+- `--ports <list>`: ports to sweep on bare hosts and subnets, ranges allowed (default: `80,443,8080,8443`)
+- `--connect-timeout <float>`: TCP connect timeout during the port sweep (default: `2.0`)
+- `--no-port-scan`: skip the port sweep and fingerprint every expanded endpoint
+- `--scan-workers <int>`: concurrent workers for the port sweep (default: `100`)
+- `--show-skipped`: print a line for every endpoint that is not a supported printer
+- `--scheme {http,https}`: scheme for ports with no well-known default (default: `https`)
+- `--timeout <int>`: HTTP request timeout in seconds (default: `10`)
+- `--workers <int>`: number of concurrent workers for HTTP stages (default: `10`)
+- `--verify`: enable TLS certificate verification (disabled by default)
+- `--export`: export address books from devices with successful default credentials
+- `--output-dir <path>`: output directory for exported address books (default: current directory)
+- `--export-timeout <int>`: timeout in seconds for export requests (default: `30`)
+- `--success-file <path>`: output file for successful logins (default: `successful_logins.txt`)
+- `--verbose`: show all HTTP requests and responses
 
 ### Examples
 
-#### Basic credential check (no export)
+#### Sweep a subnet
 ```bash
-python3 ricohprint_defaultcredchecker.py ./hosts.txt
+python3 printer_credcheck.py 10.10.62.0/24
 ```
 
-#### Check credentials AND export address books
+#### Sweep several ranges at once, including extra ports
 ```bash
-python3 ricohprint_defaultcredchecker.py ./hosts.txt --export
+python3 printer_credcheck.py 10.10.62.0/24 10.10.70.1-50 --ports 80,443,8080,8443,631
 ```
 
-#### Export with custom timeout and output directory
+#### Fingerprint and test everything in a file
 ```bash
-python3 ricohprint_defaultcredchecker.py ./hosts.txt --export --export-timeout 60 --output-dir ./exports
+python3 printer_credcheck.py ./hosts.txt
 ```
 
-#### Use HTTP and enable verbose debugging
+#### See why things on the range were skipped
 ```bash
-python3 ricohprint_defaultcredchecker.py ./hosts.txt --scheme http --export --verbose
+python3 printer_credcheck.py 10.10.62.0/24 --show-skipped
 ```
 
-#### Scan with more workers and enable TLS verification
+#### Only test Sharp devices
 ```bash
-python3 ricohprint_defaultcredchecker.py ./hosts.txt --workers 20 --verify --export
+python3 printer_credcheck.py ./hosts.txt --vendor sharp
 ```
 
-#### Specify custom output file for successful logins
+#### Check credentials and export Ricoh address books
 ```bash
-python3 ricohprint_defaultcredchecker.py ./hosts.txt --success-file ./results/logins.txt
+python3 printer_credcheck.py ./hosts.txt --vendor ricoh --export
+```
+
+#### Try a non-default password list on Sharp devices
+```bash
+python3 printer_credcheck.py ./hosts.txt --vendor sharp --accounts 'Administrator:admin,Administrator:sharp'
+```
+
+#### See what each vendor module will send
+```bash
+python3 printer_credcheck.py --list-vendors
+```
+
+#### Verbose debugging over HTTP
+```bash
+python3 printer_credcheck.py ./hosts.txt --scheme http --verbose
 ```
 
 ### Output
 
-The script runs in two stages:
-1. **Stage 1**: Checks each host to verify it's a Ricoh printer
-2. **Stage 2**: Tests credentials only on confirmed Ricoh printers
+The scan runs in three stages:
+1. **Step 1** — expand the targets and port sweep them for listening HTTP services
+2. **Step 2** — fingerprint every live service and assign it to a vendor module (or skip it)
+3. **Step 3** — test that vendor's default accounts, then export where supported
 
-#### Basic credential check output
-```text
-Step 1: Checking if 5 host(s) are Ricoh printers...
-Workers: 10
---------------------------------------------------------------------------------
-✓ 10.10.62.20	Ricoh printer detected (found: RICOH, Web Image Monitor, /web/guest/)
-✗ 10.1.96.25	SKIPPED: Not a Ricoh printer (no Ricoh indicators found in response)
-✓ 10.10.62.21	Ricoh printer detected (redirect to auth page)
-✗ 10.1.96.44	SKIPPED: Not a Ricoh printer (HTTP 404 - page not found)
-✓ 10.10.62.22	Ricoh printer detected (found: RICOH, websys/webArch, /web/guest/)
+Skipped endpoints are counted rather than listed; pass `--show-skipped` to see each one and
+the reason every module rejected it.
 
---------------------------------------------------------------------------------
-Step 2: Testing credentials on 3 confirmed Ricoh printer(s)...
-Testing usernames: admin, supervisor
-Total credential tests: 6
---------------------------------------------------------------------------------
-[1/6] 10.10.62.20     admin           FAIL    status=302
-[2/6] 10.10.62.20     supervisor      FAIL    status=302
-[3/6] 10.10.62.21     admin           SUCCESS status=302
-[4/6] 10.10.62.21     supervisor      SUCCESS status=302
-[5/6] 10.10.62.22     admin           SUCCESS status=302
-[6/6] 10.10.62.22     supervisor      FAIL    status=302
-```
+Successful logins are written to `--success-file` in backtick-delimited format:
 
-#### With address book export enabled
-```text
-Step 1: Checking if 3 host(s) are Ricoh printers...
-Workers: 10
---------------------------------------------------------------------------------
-✓ 10.10.62.20	Ricoh printer detected (found: RICOH, Web Image Monitor)
-✓ 10.10.62.21	Ricoh printer detected (found: RICOH, /web/guest/)
-✓ 10.10.62.22	Ricoh printer detected (redirect to auth page)
-
---------------------------------------------------------------------------------
-Step 2: Testing credentials on 3 confirmed Ricoh printer(s)...
-Testing usernames: admin, supervisor
-Total credential tests: 6
---------------------------------------------------------------------------------
-[1/6] 10.10.62.20     admin           FAIL    status=302
-[2/6] 10.10.62.20     supervisor      FAIL    status=302
-[3/6] 10.10.62.21     admin           SUCCESS status=302
-[3/6] 10.10.62.21     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.21.txt
-[4/6] 10.10.62.21     supervisor      SUCCESS status=302
-[5/6] 10.10.62.22     admin           SUCCESS status=302
-[5/6] 10.10.62.22     EXPORT: SUCCESS: Exported to ./addressbook_10.10.62.22.txt
-[6/6] 10.10.62.22     supervisor      FAIL    status=302
-```
-
-**Note**: 
-- **Stage 1** filters out non-Ricoh devices to prevent false positives
-- **Stage 2** progress counter `[X/Y]` shows current progress in real-time as tests complete
-- Results appear immediately as workers finish (not sorted by host during execution)
-- Address books are only exported for successful admin logins
-- The supervisor account has limited privileges and cannot export address books
-
-#### Final summary
-```text
-Total Hosts: 5	Ricoh Printers: 3	Skipped: 2
-Credential Tests: 6	SUCCESS: 4	FAIL: 2	ERROR: 0	EXPORTED: 2
-
-Successful logins saved to: successful_logins.txt (4 entry/entries)
-
-Extracting emails from address books...
-Extracted 15 unique email(s) to ./extracted_emails.txt
-
-Extracting names from address books...
-Extracted 18 unique name(s) to ./extracted_names.txt
-```
-
-#### Successful Logins File Format
-The `successful_logins.txt` file contains backtick-delimited entries for all successful default credential logins:
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
-10.10.62.21`10.10.62.21`tcp`443`Successful login with username 'admin' and blank password (HTTP 302)
-10.10.62.21`10.10.62.21`tcp`443`Successful login with username 'supervisor' and blank password (HTTP 302)
-10.10.62.22:8080`10.10.62.22:8080`tcp`8080`Successful login with username 'admin' and blank password (HTTP 302)
-192.168.1.50`192.168.1.50`tcp`80`Successful login with username 'admin' and blank password (HTTP 302)
+192.0.2.113`192.0.2.113`tcp`443`Successful Sharp MFP login with account 'Administrator' and password admin (HTTP 302)
 ```
 
-**Format Details:**
-- **Delimiter**: Backtick (`) character
-- **AssetName**: The host/IP (matches EngagementAsset)
-- **URI**: The host/IP with optional port
-- **Protocol**: `tcp` (web services use TCP)
-- **Port**: `443` for HTTPS, `80` for HTTP, or custom port if specified
-- **Output**: Description of the successful login including username and HTTP status
+Exported Ricoh address books are saved as `addressbook_ricoh_<host>.txt`, and the parsed
+contacts land in `extracted_emails.txt` and `extracted_names.txt` in the output directory.
 
-### Result interpretation
-- **SUCCESS**: Login succeeded with default credentials (HTTP 302 redirect to mainFrame.cgi)
-- **FAIL**: Authentication failed (redirect to authForm.cgi or "Authentication has failed" in response)
-- **ERROR: HTTP <code>**: Unexpected HTTP status code returned
-- **ERROR: <exception>**: Network or TLS error occurred while making the request
-- **EXPORT: SUCCESS**: Address book successfully exported to file
-- **EXPORT: ERROR**: Address book export failed (details included in message)
+### Adding a vendor
+1. Create `vendors/<vendor>.py` with a class that subclasses `PrinterModule` from `vendors/base.py`.
+2. Implement `fingerprint()` and `attempt_login()`. Implement `export_address_book()` and
+   `extract_contacts()` too if you have a captured export request, and set `supports_export = True`.
+3. Register the class in `MODULES` in `vendors/__init__.py`.
 
-### Address Book Export
+`vendors/base.py` supplies the shared `Target` / `Account` / `ScanContext` / `LoginResult`
+types plus the verbose logging and `Set-Cookie` parsing helpers, so a module only has to
+describe the vendor's own request flow.
 
-When `--export` is enabled, the script performs a three-step process for each printer with successful default credentials:
-
-1. **Login**: Authenticate with default credentials (admin/empty password)
-   - Captures `wimsesid` and `risessionid` cookies from 302 response
-
-2. **Navigate to Address List**: Access the address book section
-   - Gets a fresh `risessionid` specific to the address book module
-
-3. **Export Data**: Download the address book entries
-   - Saves data to `addressbook_<hostname>.txt` in JSON-like array format
-
-#### Exported Data Format
-Address books are saved as plain text files containing arrays of contact entries:
-```
-[[28,1,'00001','Accounting Scans','','1665508224#Oct 11,2022 12:10 PM','','\\\\DC-12DC\\VC_Data\\Scans'],
- [29,2,'00002','Corp Acctng','','0000000000#--- --,---- --:-- --','',''],
- [30,1,'00003','John Doe','','1653592843#May 26,2022 02:20 PM','john.doe@example.com','']]
-```
-
-Each entry contains: ID, type, number, name, description, timestamp, email, and network path.
-
-#### Automatic Email & Name Extraction
-
-After all address books are exported, the script automatically parses them and extracts:
-
-1. **Emails**: Extracts all email addresses (index 6 in each entry)
-   - Basic validation: must contain `@` and `.`
-   - Duplicates are automatically removed
-   - Saved to `extracted_emails.txt` (one email per line, sorted alphabetically)
-
-2. **Names**: Extracts all contact names (index 3 in each entry)
-   - Filters out empty values
-   - Duplicates are automatically removed  
-   - Saved to `extracted_names.txt` (one name per line, sorted alphabetically)
-
-**Example extracted_emails.txt:**
-```
-accounting@example.com
-hr@example.com
-john.doe@example.com
-sales@example.com
-```
-
-**Example extracted_names.txt:**
-```
-Accounting Scans
-Corp Acctng
-HR Department
-John Doe
-Sales Team
-```
-
-This automated extraction happens only when `--export` is used and at least one address book is successfully exported.
-
-### Verbose Mode
-
-With `--verbose`, the script displays detailed information about each HTTP transaction:
-
-```text
-================================================================================
-[LOGIN REQUEST] 10.9.65.127
-================================================================================
-POST http://10.9.65.127/web/guest/en/websys/webArch/login.cgi
-
-Headers:
-  User-Agent: Mozilla/5.0...
-  Content-Type: application/x-www-form-urlencoded
-  ...
-
-Cookies:
-  risessionid: 012450409054315
-  cookieOnOffChecker: on
-  wimsesid: --
-
-Form Data:
-  userid: YWRtaW4=
-  password: 
-  ...
-================================================================================
-
-================================================================================
-[LOGIN RESPONSE] 10.9.65.127
-================================================================================
-Status: 302
-
-Response Headers:
-  Set-Cookie: risessionid=066124883298009;HttpOnly
-  Set-Cookie: wimsesid=178962527;path=/;HttpOnly
-  Location: /web/entry/en/websys/webArch/mainFrame.cgi
-  ...
-
-Response Body (105 bytes):
-<html><head><title>302 Moved Temporarily</title></head>...
-================================================================================
-
-[DEBUG] 10.9.65.127: Manually parsed Set-Cookie: {'risessionid': '066124883298009', 'wimsesid': '178962527'}
-[DEBUG] 10.9.65.127: Final captured cookies for session: {...}
-```
-
-This is useful for:
-- Troubleshooting authentication issues
-- Verifying cookie capture
-- Understanding the authentication flow
-- Debugging network problems
-
-### Exit codes
-- `0`: At least one host produced a `SUCCESS` or `FAIL` result (requests completed successfully)
-- `1`: No hosts were found in the file, or all attempts resulted in errors
-
-### Security Notes and Best Practices
-
-⚠️ **Important Security Considerations:**
-
-1. **Legal Authorization**: Only scan devices you own or have explicit permission to test
-2. **Network Impact**: Be mindful of the load on production systems
-3. **Credential Testing**: This script tests for default credentials which is a security assessment activity
-4. **Data Handling**: Exported address books may contain sensitive contact information (emails, names, network paths)
-5. **TLS Verification**: Disabled by default to handle self-signed certificates - use `--verify` in trusted environments
-
-**Recommendations:**
-- Store exported address books and extracted files securely
-- Notify device administrators of findings
-- Delete exported data (`addressbook_*.txt`, `extracted_emails.txt`, `extracted_names.txt`) after analysis
-- Use this tool as part of a broader security assessment
-- Respect rate limits and timeout settings on production networks
-
-### Technical Notes
-
-#### Authentication Flow
-The script implements the Ricoh printer web interface authentication:
-1. Default credentials: Username `admin` (base64 encoded as `YWRtaW4=`), empty password
-2. Successful login returns HTTP 302 redirect with session cookies
-3. The script properly handles duplicate cookie values in Set-Cookie headers
-4. Address book access requires session-specific `risessionid` cookie
-
-#### Cookie Handling
-The script includes special logic to handle Ricoh's cookie implementation:
-- Parses Set-Cookie headers manually to capture the correct session IDs
-- Filters out reset values (`wimsesid=--`)
-- Maintains separate cookies for different application sections
-
-#### Multi-threading
-- Uses `ThreadPoolExecutor` for concurrent requests
-- Default: 10 workers (adjustable with `--workers`)
-- Each host is processed independently
-
-### Troubleshooting
-
-**Issue**: Login shows SUCCESS but export fails
-- Try increasing `--export-timeout` (some printers are slow)
-- Use `--verbose` to see detailed request/response data
-- Verify the printer has an address book configured
-
-**Issue**: All requests timeout
-- Increase `--timeout` value
-- Check network connectivity to printers
-- Verify the scheme (http vs https) is correct
-
-**Issue**: TLS/SSL errors
-- Use `--scheme http` if printers don't support HTTPS
-- Use `--verify` flag only if you trust the certificates
-- Check if printers are on correct ports
-
-**Issue**: Exported files are empty or contain error messages
-- Printer may have logged out the session (rare race condition)
-- Use `--verbose` to see what data was received
-- Verify printer firmware version is compatible
-
-**Issue**: Email/name extraction shows 0 results despite successful exports
-- Verify the `addressbook_*.txt` files contain data in the expected format
-- The extraction expects array format: `[[id, type, number, name, ..., email, ...], ...]`
-- Use `--verbose` to see the raw export data
-- Some printers may use a different address book format (not yet supported)
-
-### Requirements
-- Python 3.6+
-- `requests` library (`pip install requests`)
-
-### License
-Use responsibly and only on systems you own or have permission to test.
+### Known gaps
+- **Sharp address book export** is not implemented. The credential check is complete, but
+  exporting needs a captured authenticated export request from a Sharp MFP (the UI page is
+  `/addressbook.html`; the underlying data request has not been captured yet).

@@ -1,0 +1,9 @@
+# Scan output - never commit results
+successful_logins.txt
+addressbook_*.txt
+extracted_emails.txt
+extracted_names.txt
+hosts.txt
+
+__pycache__/
+*.pyc
