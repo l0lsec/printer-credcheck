@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import discovery
 import vendors
-from vendors.base import Account, LoginResult, PrinterModule, ScanContext, Target
+from vendors.base import Account, LoginResult, PrinterModule, ScanContext, Target, VulnFinding
 
 
 def parse_accounts(spec: str) -> List[Account]:
@@ -215,6 +215,14 @@ def main() -> int:
     parser.add_argument("--priority-file", default="priority_followup.txt",
                         help="Output file for priority findings: devices with both a service "
                              "account default and scan-to-folder entries (default: priority_followup.txt)")
+    parser.add_argument("--vulns-file", default="vulnerabilities.txt",
+                        help="Output file for vendor-published vulnerability findings, same "
+                             "report format (default: vulnerabilities.txt)")
+    parser.add_argument("--no-vuln-checks", action="store_true",
+                        help="Skip the published-vulnerability stage (Sharp: pre-auth LFI "
+                             "probe against /installed_emanual_down.html plus advisory-only "
+                             "findings for CVE-2024-28038, CVE-2024-34162, CVE-2024-36248, "
+                             "hardcoded AWS keys, and CVE-2022-45796)")
     parser.add_argument("--findings-delimiter", choices=["backtick", "tab"], default="backtick",
                         help="Field delimiter for the findings files (default: backtick)")
 
@@ -433,6 +441,56 @@ def main() -> int:
             if existing is None or (account.can_export and not existing.account.can_export):
                 success_by_host[target.hostport] = result
 
+    # ---- Stage 3.5: published-vulnerability checks ---------------------
+    # Non-destructive checks tied to each vendor's advisories. Where a safe
+    # probe exists (e.g. Sharp's pre-auth LFI, which is a plain read of
+    # /etc/passwd), we run it and mark the finding verified. For CVEs whose
+    # only reliable proof would crash the device, rewrite its configuration,
+    # or exfiltrate real user credentials, the module returns advisory-only
+    # findings instead. Every finding here is a per-device report row.
+    vuln_findings_rows: List[Tuple[str, str, str, str, str]] = []
+    verified_vulns = 0
+    if not args.no_vuln_checks:
+        vuln_targets = [(t, m) for t, m in identified if m.supports_vuln_checks]
+        if vuln_targets:
+            print(f"\n{'-' * 80}")
+            print(f"Step 3.5: Checking published vulnerabilities on {len(vuln_targets)} printer(s)")
+            print("-" * 80)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(module.check_vulnerabilities, target, ctx,
+                                    success_by_host.get(target.hostport)): (target, module)
+                    for target, module in vuln_targets
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    target, module = futures[future]
+                    try:
+                        findings: List[VulnFinding] = future.result()
+                    except Exception as exc:
+                        print(f"{target.hostport}\tVULN CHECK ERROR: "
+                              f"{exc.__class__.__name__}: {exc}")
+                        continue
+                    for finding in findings:
+                        mark = "verified" if finding.verified else "advisory"
+                        if finding.verified and finding.severity == "critical":
+                            symbol = "⚠⚠⚠"
+                        elif finding.severity in ("critical", "high"):
+                            symbol = "⚠⚠"
+                        else:
+                            symbol = "⚠"
+                        print(f"{symbol} VULN [{finding.cve}] [{finding.severity}] "
+                              f"[{mark}] {target.hostport}\t{finding.title}")
+                        if finding.verified:
+                            verified_vulns += 1
+                        output_field = (
+                            f"{finding.cve} [{finding.severity}] [{mark}] - "
+                            f"{finding.title}. {finding.output}"
+                        )
+                        vuln_findings_rows.append(
+                            (target.hostport, target.hostport, "tcp",
+                             target.port, output_field)
+                        )
+
     # ---- Stage 4: harvest address books --------------------------------
     all_emails: List[str] = []
     all_names: List[str] = []
@@ -519,6 +577,9 @@ def main() -> int:
     summary += (f"\nFindings\tDefault credentials: {len(default_findings)}"
                 f"\tScan-to-folder: {len(folder_findings)}"
                 f"\tPriority follow-up: {len(priority_findings)}")
+    if not args.no_vuln_checks:
+        summary += (f"\tVulnerabilities: {len(vuln_findings_rows)} "
+                    f"({verified_vulns} verified)")
     print(summary)
 
     if successful_logins:
@@ -543,6 +604,10 @@ def main() -> int:
     if priority_findings:
         write_findings(args.priority_file, priority_findings, delimiter,
                        "⚠⚠⚠ Priority follow-up findings")
+    if vuln_findings_rows:
+        label = (f"⚠ Vulnerability findings ({verified_vulns} verified, "
+                 f"{len(vuln_findings_rows) - verified_vulns} advisory)")
+        write_findings(args.vulns_file, vuln_findings_rows, delimiter, label)
 
     if args.export and (all_emails or all_names):
         emails = sorted(set(all_emails))

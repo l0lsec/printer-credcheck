@@ -6,7 +6,7 @@ subclasses PrinterModule and registering it below.
 """
 from typing import Dict, List
 
-from .base import Account, LoginResult, PrinterModule, ScanContext, Target
+from .base import Account, LoginResult, PrinterModule, ScanContext, Target, VulnFinding
 from .ricoh import RicohModule
 from .sharp import SharpModule
 
@@ -30,6 +30,6 @@ def names() -> List[str]:
 
 
 __all__ = [
-    "Account", "LoginResult", "PrinterModule", "ScanContext", "Target",
+    "Account", "LoginResult", "PrinterModule", "ScanContext", "Target", "VulnFinding",
     "MODULES", "BY_NAME", "get", "names",
 ]

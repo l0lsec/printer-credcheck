@@ -81,6 +81,26 @@ class LoginResult:
         return self.outcome == "SUCCESS"
 
 
+@dataclass
+class VulnFinding:
+    """A single published vulnerability finding for a device.
+
+    Two flavours coexist. ``verified=True`` means the module actively confirmed
+    the condition on this device with a safe probe (e.g. an unauthenticated
+    read that returned the file). ``verified=False`` means the finding is
+    advisory-only: the vendor advisory names the product and firmware family
+    but the module deliberately declines to exploit the condition because
+    doing so would crash, reboot, reconfigure, or exfiltrate real user
+    credentials from the printer.
+    """
+
+    cve: str
+    title: str
+    output: str
+    severity: str = "high"      # critical | high | medium | info
+    verified: bool = False
+
+
 class PrinterModule:
     """Base class for a vendor implementation."""
 
@@ -89,6 +109,7 @@ class PrinterModule:
     default_accounts: List[Account] = []
     supports_export = False
     supports_scrape = False
+    supports_vuln_checks = False
     export_note = ""
 
     # ---- required ------------------------------------------------------
@@ -135,6 +156,21 @@ class PrinterModule:
         visitors. Returns (emails, names, message).
         """
         return [], [], "SKIPPED: contact scraping not supported for this vendor"
+
+    def check_vulnerabilities(self, target: Target, ctx: ScanContext,
+                              login_result: Optional[LoginResult] = None) -> List["VulnFinding"]:
+        """
+        Non-destructive vulnerability checks for a fingerprinted device.
+
+        Where a safe probe exists (an unauthenticated read that leaves the
+        device untouched), the check runs and returns a ``verified=True``
+        finding on a hit. For CVEs whose only reliable test would crash,
+        reboot, reconfigure, or exfiltrate real user credentials from the
+        printer, the module returns an ``verified=False`` advisory finding
+        instead, on the strength of the fingerprint and the published
+        advisory. Modules that don't implement this return an empty list.
+        """
+        return []
 
     def accounts(self, override: Optional[List[Account]] = None) -> List[Account]:
         return override if override else list(self.default_accounts)

