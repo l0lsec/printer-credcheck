@@ -192,10 +192,11 @@ def main() -> int:
                         help="Number of concurrent workers for HTTP stages (default: 10)")
     parser.add_argument("--verify", action="store_true",
                         help="Verify TLS certificates (default: disabled)")
-    parser.add_argument("--export", action="store_true",
-                        help="Harvest address books: export them where default credentials "
-                             "work, otherwise read whatever the device exposes without a "
-                             "login. Writes emails, names, and usernames.")
+    parser.add_argument("--no-export", action="store_true",
+                        help="Skip the address book harvest stage. By default the tool exports "
+                             "address books from every device whose default credentials worked "
+                             "and falls back to reading whatever the device exposes without a "
+                             "login (Sharp only), then writes emails, names, and usernames.")
     parser.add_argument("--output-dir", default=".",
                         help="Output directory for exported address books (default: current directory)")
     parser.add_argument("--export-timeout", type=int, default=30,
@@ -272,7 +273,7 @@ def main() -> int:
         print("No targets found.")
         return 1
 
-    if args.export:
+    if not args.no_export:
         os.makedirs(args.output_dir, exist_ok=True)
 
     ctx = ScanContext(
@@ -495,7 +496,7 @@ def main() -> int:
     all_emails: List[str] = []
     all_names: List[str] = []
 
-    if args.export:
+    if not args.no_export:
         print(f"\n{'-' * 80}")
         print(f"Step 4: Harvesting address books from {len(identified)} printer(s)")
         print("-" * 80)
@@ -572,7 +573,7 @@ def main() -> int:
     summary = (f"\nEndpoints: {len(endpoints)}\tListening: {len(live)}\t"
                f"Printers: {len(identified)}\tSkipped: {skipped}"
                f"\nCredential Tests: {len(jobs)}\tSUCCESS: {successes}\tFAIL: {failures}\tERROR: {errors}")
-    if args.export:
+    if not args.no_export:
         summary += f"\tEXPORTED: {exported}\tHARVESTED: {harvested}"
     summary += (f"\nFindings\tDefault credentials: {len(default_findings)}"
                 f"\tScan-to-folder: {len(folder_findings)}"
@@ -609,7 +610,7 @@ def main() -> int:
                  f"{len(vuln_findings_rows) - verified_vulns} advisory)")
         write_findings(args.vulns_file, vuln_findings_rows, delimiter, label)
 
-    if args.export and (all_emails or all_names):
+    if (not args.no_export) and (all_emails or all_names):
         emails = sorted(set(all_emails))
         names = sorted(set(all_names))
         usernames = usernames_from_emails(emails)

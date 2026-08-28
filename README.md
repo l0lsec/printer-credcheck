@@ -156,7 +156,7 @@ supports:
 Changing the administrator password does not necessarily protect the address book. On the
 Sharp MFPs tested, `/addressbook.html` renders the full contact table - names and e-mail
 addresses - to anonymous visitors, with only the *Login* button hinting that no session
-exists. `--export` therefore falls back to reading that page whenever a device's default
+exists. The harvest stage therefore falls back to reading that page whenever a device's default
 credentials have been changed:
 
 ```text
@@ -268,7 +268,8 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 - `--timeout <int>`: HTTP request timeout in seconds (default: `10`)
 - `--workers <int>`: number of concurrent workers for HTTP stages (default: `10`)
 - `--verify`: enable TLS certificate verification (disabled by default)
-- `--export`: export address books from devices with successful default credentials
+- `--no-export`: skip the address book harvest stage (by default the tool exports on success
+  and falls back to the unauthenticated read on failure)
 - `--output-dir <path>`: output directory for exported address books (default: current directory)
 - `--export-timeout <int>`: timeout in seconds for export requests (default: `30`)
 - `--success-file <path>`: output file for successful logins (default: `successful_logins.txt`)
@@ -307,9 +308,14 @@ python3 printer_credcheck.py 10.10.62.0/24 --show-skipped
 python3 printer_credcheck.py ./hosts.txt --vendor sharp
 ```
 
-#### Check credentials and harvest address books, usernames included
+#### Change the output directory for the address book export
 ```bash
-python3 printer_credcheck.py 10.10.62.0/24 --export --output-dir ./exports
+python3 printer_credcheck.py 10.10.62.0/24 --output-dir ./exports
+```
+
+#### Test credentials only (skip both address book harvest and CVE checks)
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --no-export --no-vuln-checks
 ```
 
 #### Try a non-default password list on Sharp devices
@@ -341,7 +347,7 @@ The scan runs in five stages:
 4. **Step 3.5** — run vendor-published-CVE checks against the fingerprinted devices
    (Sharp: safe pre-auth LFI probe + advisory findings; skipped with `--no-vuln-checks`)
 5. **Step 4** — harvest address books, by export where the credentials worked and by
-   unauthenticated read where they did not
+   unauthenticated read where they did not (skipped with `--no-export`)
 
 Skipped endpoints are counted rather than listed; pass `--show-skipped` to see each one and
 the reason every module rejected it.
@@ -372,7 +378,7 @@ regular administrator defaults:
 192.0.2.113`192.0.2.113`tcp`443`Default credentials in use - Sharp MFP accepts account 'Service' with default password 'service'. Change the vendor default to a strong, unique password. Technician-level service account - grants access to diagnostic functions; prioritise remediation.
 ```
 
-`--folder-findings-file` (default `scan_to_folder.txt`, requires `--export`) — one row per device
+`--folder-findings-file` (default `scan_to_folder.txt`, skipped under `--no-export`) — one row per device
 whose exported address book holds scan-to-folder (FTP/SMB) destinations. These store reusable
 credentials so the MFP can drop scans onto an internal share unattended, so each is worth
 reporting on its own. The finding names the destinations and whether a password is stored; the
@@ -383,7 +389,7 @@ password *values* stay in the exported CSV on disk and are never written into th
 192.0.2.113`192.0.2.113`tcp`443`Address book contains 2 scan-to-folder destination(s) storing reusable credentials for internal shares: [FTP] ftp.corp.example/scans (user: svc-scanner, password stored); [SMB] \\SHARESRV\share$ (user: EXAMPLE\svc-printer, password stored). Review whether each is required and rotate the service accounts.
 ```
 
-`--priority-file` (default `priority_followup.txt`, requires `--export`) — one row per device
+`--priority-file` (default `priority_followup.txt`, skipped under `--no-export`) — one row per device
 that has **both** a technician-level service account default (Service/FSS) **and** scan-to-folder
 destinations in its address book. This combination is the highest priority because a default
 technician login paired with stored network credentials for internal shares creates a lateral
