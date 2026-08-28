@@ -31,6 +31,9 @@ Supported today:
 - **Scan-to-folder alerting**: warns when an exported address book holds scan-to-folder (FTP/SMB)
   destinations, which store reusable service-account credentials for internal shares, and writes
   them to their own findings file (`scan_to_folder.txt`)
+- **Priority follow-up**: devices that have both a technician-level service account default *and*
+  scan-to-folder destinations are flagged separately in `priority_followup.txt` — these combine
+  default credentials with stored network credentials and should be remediated first
 - **Successful login export**: writes all successful logins to a backtick-delimited file
 - **Address book export**: pulls address books from vulnerable devices (supported vendors)
 - **Unauthenticated harvest**: when default credentials fail, still reads whatever contacts the
@@ -231,6 +234,7 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 - `--success-file <path>`: output file for successful logins (default: `successful_logins.txt`)
 - `--findings-file <path>`: output file for default-credential findings (default: `default_credentials.txt`)
 - `--folder-findings-file <path>`: output file for scan-to-folder findings (default: `scan_to_folder.txt`)
+- `--priority-file <path>`: output file for priority follow-up findings — devices with both a service account default and scan-to-folder entries (default: `priority_followup.txt`)
 - `--findings-delimiter {backtick,tab}`: field delimiter for the findings files (default: `backtick`)
 - `--verbose`: show all HTTP requests and responses
 
@@ -302,18 +306,21 @@ Successful logins are written to `--success-file` in backtick-delimited format:
 
 #### Findings files
 
-Two findings files are written in the same reporting format - `AssetName`, `URI`, `Protocol`,
+Three findings files are written in the same reporting format - `AssetName`, `URI`, `Protocol`,
 `Port`, `Output` - so they drop straight into the client report. The `AssetName` is the same
 `host:port` the successful-logins file uses, which needs to match an existing EngagementAsset.
 Fields are backtick-delimited by default; pass `--findings-delimiter tab` for tab-delimited.
 Each file is written only when it has at least one finding.
 
 `--findings-file` (default `default_credentials.txt`) — one row per device/account still on a
-vendor default. Each one is also printed on the console the moment it is found:
+vendor default. Technician-level accounts (Service, FSS) are called out with a risk note in the
+Output column and a distinct `⚠⚠ SERVICE ACCOUNT DEFAULT` console alert so they stand out from
+regular administrator defaults:
 
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
 192.0.2.113`192.0.2.113`tcp`443`Default credentials in use - Sharp MFP accepts account 'Administrator' with default password 'admin'. Change the vendor default to a strong, unique password.
+192.0.2.113`192.0.2.113`tcp`443`Default credentials in use - Sharp MFP accepts account 'Service' with default password 'service'. Change the vendor default to a strong, unique password. Technician-level service account - grants access to diagnostic functions; prioritise remediation.
 ```
 
 `--folder-findings-file` (default `scan_to_folder.txt`, requires `--export`) — one row per device
@@ -325,6 +332,17 @@ password *values* stay in the exported CSV on disk and are never written into th
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
 192.0.2.113`192.0.2.113`tcp`443`Address book contains 2 scan-to-folder destination(s) storing reusable credentials for internal shares: [FTP] ftp.corp.example/scans (user: svc-scanner, password stored); [SMB] \\SHARESRV\share$ (user: EXAMPLE\svc-printer, password stored). Review whether each is required and rotate the service accounts.
+```
+
+`--priority-file` (default `priority_followup.txt`, requires `--export`) — one row per device
+that has **both** a technician-level service account default (Service/FSS) **and** scan-to-folder
+destinations in its address book. This combination is the highest priority because a default
+technician login paired with stored network credentials for internal shares creates a lateral
+movement risk. These devices are also flagged on the console with a `⚠⚠⚠ PRIORITY` alert:
+
+```text
+# Format: AssetName`URI`Protocol`Port`Output
+192.0.2.113`192.0.2.113`tcp`443`PRIORITY - Device has default service account credentials (FSS, Service) and scan-to-folder destinations storing reusable credentials for internal shares. A technician-level login combined with stored network credentials increases the risk of lateral movement. Change the service account defaults and review the scan-to-folder destinations immediately.
 ```
 
 Exported address books are saved per vendor - `addressbook_ricoh_<host>.txt` for Ricoh's
