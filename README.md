@@ -13,7 +13,7 @@ Supported today:
 | Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest |
 |---|---|---|---|---|
 | Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `fssservice` | Yes (CSV) | Yes |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -106,7 +106,7 @@ redirect to the same `/login.html` form with a different post-login target:
 |---|---|---|---|
 | `/login.html` | `/login.html?/addressbook.html` | `3` Administrator | `admin` |
 | `/service_login.html` | `/login.html?/service_testpage.html` | `4` Service | `service` |
-| `/fss_default.html` | `/login.html?/fss_default.html` | `7` FSS | `fssservice` |
+| `/fss_default.html` | `/login.html?/fss_default.html` | `7` FSS | `servicefss` |
 
 The exchange is otherwise identical, so the module maps each account's role name to its target
 page (`ROLE_TARGETS`) and reuses the same login flow. The role *value* is read from the form

@@ -2,6 +2,7 @@
 successful_logins.txt
 default_credentials.txt
 scan_to_folder.txt
+priority_followup.txt
 addressbook_*
 extracted_emails.txt
 extracted_names.txt

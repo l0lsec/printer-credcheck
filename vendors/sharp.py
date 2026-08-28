@@ -315,13 +315,15 @@ class SharpModule(PrinterModule):
             password="service",
             can_export=False,
             note="Sharp factory default service-mode password",
+            risk_note="Technician-level service account - grants access to diagnostic functions; prioritise remediation",
         ),
         Account(
             label="FSS",
             username="FSS",
-            password="fssservice",
+            password="servicefss",
             can_export=False,
             note="Sharp factory default FSS (field service) password",
+            risk_note="Technician-level field-service account - grants access to diagnostic functions; prioritise remediation",
         ),
     ]
 

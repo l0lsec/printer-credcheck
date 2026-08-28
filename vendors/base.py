@@ -49,6 +49,7 @@ class Account:
     password: str = ""  # blank for Ricoh defaults, "admin" for Sharp defaults
     can_export: bool = True
     note: str = ""
+    risk_note: str = ""  # appended to findings, e.g. "Technician account - prioritise remediation"
 
     def describe(self) -> str:
         return f"{self.label}:{self.password}" if self.password else f"{self.label}:<blank>"

@@ -212,6 +212,9 @@ def main() -> int:
     parser.add_argument("--folder-findings-file", default="scan_to_folder.txt",
                         help="Output file for scan-to-folder address book findings, same "
                              "report format (default: scan_to_folder.txt)")
+    parser.add_argument("--priority-file", default="priority_followup.txt",
+                        help="Output file for priority findings: devices with both a service "
+                             "account default and scan-to-folder entries (default: priority_followup.txt)")
     parser.add_argument("--findings-delimiter", choices=["backtick", "tab"], default="backtick",
                         help="Field delimiter for the findings files (default: backtick)")
 
@@ -358,6 +361,7 @@ def main() -> int:
     # client can be told exactly which devices still ship factory logins.
     default_findings: List[Tuple[str, str, str, str, str]] = []
     folder_findings: List[Tuple[str, str, str, str, str]] = []
+    service_default_hosts: Dict[str, List[str]] = {}
     success_by_host: Dict[str, LoginResult] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -406,16 +410,23 @@ def main() -> int:
             if account_override is None:
                 cred_desc = (f"default password '{account.password}'"
                              if account.password else "a blank password")
+                risk = f" {account.risk_note}." if account.risk_note else ""
                 finding = (
                     f"Default credentials in use - {module.display_name} accepts account "
                     f"'{account.label}' with {cred_desc}. Change the vendor default to a "
-                    f"strong, unique password."
+                    f"strong, unique password.{risk}"
                 )
                 default_findings.append(
                     (target.hostport, target.hostport, "tcp", target.port, finding)
                 )
-                print(f"    ⚠ DEFAULT CREDENTIALS: {target.hostport}  {module.display_name}  "
-                      f"'{account.label}' / {account.password or '<blank>'}")
+                if account.risk_note:
+                    service_default_hosts.setdefault(target.hostport, []).append(account.label)
+                    print(f"    ⚠⚠ SERVICE ACCOUNT DEFAULT: {target.hostport}  "
+                          f"{module.display_name}  '{account.label}' / "
+                          f"{account.password or '<blank>'}  -- {account.risk_note}")
+                else:
+                    print(f"    ⚠ DEFAULT CREDENTIALS: {target.hostport}  {module.display_name}  "
+                          f"'{account.label}' / {account.password or '<blank>'}")
 
             # Keep the most capable session per host for the harvest stage.
             existing = success_by_host.get(target.hostport)
@@ -458,6 +469,10 @@ def main() -> int:
                               f"destination(s) in the address book, {with_pw} with a stored password")
                         for line in detail_lines:
                             print(f"    - {line}")
+                        if target.hostport in service_default_hosts:
+                            accts = ", ".join(sorted(set(service_default_hosts[target.hostport])))
+                            print(f"{target.hostport}\t⚠⚠⚠ PRIORITY: service account "
+                                  f"defaults ({accts}) + scan-to-folder on same device")
 
             # Fallback: read whatever the device shows without an export. Many
             # Sharp MFPs render their whole address book to anonymous visitors,
@@ -477,13 +492,33 @@ def main() -> int:
                 if emails or names:
                     harvested += 1
 
+    # Priority follow-up: devices that have BOTH a service account default
+    # AND scan-to-folder destinations — the combination means a technician
+    # login can reach stored credentials for internal shares.
+    priority_findings: List[Tuple[str, str, str, str, str]] = []
+    folder_hosts = {row[0] for row in folder_findings}
+    for hostport in sorted(folder_hosts & service_default_hosts.keys()):
+        accts = ", ".join(sorted(set(service_default_hosts[hostport])))
+        folder_row = next(r for r in folder_findings if r[0] == hostport)
+        port = folder_row[3]
+        output = (
+            f"PRIORITY - Device has default service account credentials ({accts}) "
+            f"and scan-to-folder destinations storing reusable credentials for "
+            f"internal shares. A technician-level login combined with stored "
+            f"network credentials increases the risk of lateral movement. "
+            f"Change the service account defaults and review the scan-to-folder "
+            f"destinations immediately."
+        )
+        priority_findings.append((hostport, hostport, "tcp", port, output))
+
     summary = (f"\nEndpoints: {len(endpoints)}\tListening: {len(live)}\t"
                f"Printers: {len(identified)}\tSkipped: {skipped}"
                f"\nCredential Tests: {len(jobs)}\tSUCCESS: {successes}\tFAIL: {failures}\tERROR: {errors}")
     if args.export:
         summary += f"\tEXPORTED: {exported}\tHARVESTED: {harvested}"
     summary += (f"\nFindings\tDefault credentials: {len(default_findings)}"
-                f"\tScan-to-folder: {len(folder_findings)}")
+                f"\tScan-to-folder: {len(folder_findings)}"
+                f"\tPriority follow-up: {len(priority_findings)}")
     print(summary)
 
     if successful_logins:
@@ -505,6 +540,9 @@ def main() -> int:
     if folder_findings:
         write_findings(args.folder_findings_file, folder_findings, delimiter,
                        "⚠ Scan-to-folder findings")
+    if priority_findings:
+        write_findings(args.priority_file, priority_findings, delimiter,
+                       "⚠⚠⚠ Priority follow-up findings")
 
     if args.export and (all_emails or all_names):
         emails = sorted(set(all_emails))
