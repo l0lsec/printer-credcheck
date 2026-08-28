@@ -50,12 +50,41 @@ LOGIN_PATH = "/login.html"
 # both drives the form into admin mode and doubles as a privilege confirmation.
 POST_LOGIN_TARGET = "/addressbook.html"
 
+# Sharp exposes more than one privileged login. Each is a shim that redirects to
+# /login.html?/<target>, and the target page fixes which authority the login
+# form's role dropdown - ggt_select(10009) - offers:
+#
+#   /service_login.html -> /login.html?/service_testpage.html   role 4 "Service"
+#   /fss_default.html   -> /login.html?/fss_default.html        role 7 "FSS"
+#
+# The login exchange is otherwise identical to the administrator flow, so the
+# module only has to point attempt_login() at the right target page. The role
+# value itself is read from the form, never hard-coded, since it is the only
+# option the target page presents.
+SERVICE_LOGIN_TARGET = "/service_testpage.html"
+FSS_LOGIN_TARGET = "/fss_default.html"
+ROLE_TARGETS = {
+    "administrator": POST_LOGIN_TARGET,
+    "service": SERVICE_LOGIN_TARGET,
+    "fss": FSS_LOGIN_TARGET,
+}
+
 # Data Import/Export (CSV Format), under System Settings. Exporting is a three
 # step dance: scrape the form for its tokens, POST the export request, then
 # follow the 302 to the generated CSV.
 STORAGE_BACKUP_PATH = "/sysmgt_storagebackup_csv.html"
 EXPORT_RADIO_FIELD = "ggt_radio(50)"
 EXPORT_TYPE_ADDRESS_BOOK = "33"     # the other option, 23, is User Register Information
+
+# Scan-to-folder destinations ride in the same address book CSV as contacts.
+# Each protocol spreads over a group of columns sharing a prefix; a row is a
+# folder destination when any of its location or credential columns is filled.
+# (label, prefix) - column names are matched case-insensitively as <prefix>-*.
+SCAN_FOLDER_PROTOCOLS = [("FTP", "ftp"), ("SMB", "smb"), ("NetFolder", "netfolder")]
+_FOLDER_HOST_COLS = ("host", "server")
+_FOLDER_PATH_COLS = ("directory", "path", "folder")
+_FOLDER_USER_COLS = ("username", "user")
+_FOLDER_PASS_COLS = ("password", "passwd")
 
 ROLE_SELECT_FIELD = "ggt_select(10009)"     # "Login Name" dropdown
 LOGIN_NAME_FIELD = "ggt_textbox(10002)"     # free-text login name (user-auth mode)
@@ -275,6 +304,25 @@ class SharpModule(PrinterModule):
             can_export=True,
             note="Sharp factory default administrator password",
         ),
+        # Technician logins. Their username doubles as the ROLE_TARGETS key that
+        # points attempt_login() at the matching login target page. Neither
+        # reaches System Settings > Data Import/Export, so can_export is False:
+        # a Service/FSS session confirms the default credential but the address
+        # book is still harvested by the unauthenticated scrape.
+        Account(
+            label="Service",
+            username="Service",
+            password="service",
+            can_export=False,
+            note="Sharp factory default service-mode password",
+        ),
+        Account(
+            label="FSS",
+            username="FSS",
+            password="fssservice",
+            can_export=False,
+            note="Sharp factory default FSS (field service) password",
+        ),
     ]
 
     # ---- fingerprint ---------------------------------------------------
@@ -334,7 +382,11 @@ class SharpModule(PrinterModule):
 
     # ---- login ---------------------------------------------------------
     def attempt_login(self, target: Target, account: Account, ctx: ScanContext) -> LoginResult:
-        login_url = f"{target.base_url}{LOGIN_PATH}?{POST_LOGIN_TARGET}"
+        # The target page after "?" selects which authority the login form
+        # offers. Administrator accounts (and any --accounts override) fall back
+        # to the address book page; Service/FSS route to their own pages.
+        target_page = ROLE_TARGETS.get(account.username.strip().lower(), POST_LOGIN_TARGET)
+        login_url = f"{target.base_url}{LOGIN_PATH}?{target_page}"
         result = LoginResult(target=target, vendor=self.name, account=account, outcome="FAIL")
 
         headers = {
@@ -739,6 +791,62 @@ class SharpModule(PrinterModule):
                 if value:
                     names.append(value)
         return emails, names
+
+    def extract_scan_to_folder(self, text: str) -> List[Dict[str, str]]:
+        """
+        Pull scan-to-folder destinations out of the exported address book CSV.
+
+        Columns are grouped by protocol prefix (ftp-*, smb-*, ...) and located by
+        name, since firmware only emits the groups for destination types the
+        device actually supports. A row counts as a folder destination once any
+        host, path, or username column for a protocol is populated; the stored
+        password is reported only as present/absent, never echoed.
+        """
+        content = (text or "").lstrip("\ufeff")
+        if not content.strip():
+            return []
+        try:
+            rows = list(csv.reader(io.StringIO(content)))
+        except csv.Error:
+            return []
+        if len(rows) < 2:
+            return []
+
+        header = [column.strip().strip('"').lower() for column in rows[0]]
+        index = {name: i for i, name in enumerate(header)}
+
+        def cell(row: List[str], column: str) -> str:
+            i = index.get(column)
+            if i is None or i >= len(row):
+                return ""
+            return row[i].strip()
+
+        def first(row: List[str], prefix: str, suffixes: Tuple[str, ...]) -> str:
+            for suffix in suffixes:
+                value = cell(row, f"{prefix}-{suffix}")
+                if value:
+                    return value
+            return ""
+
+        findings: List[Dict[str, str]] = []
+        for row in rows[1:]:
+            entry_name = cell(row, "name")
+            for label, prefix in SCAN_FOLDER_PROTOCOLS:
+                host = first(row, prefix, _FOLDER_HOST_COLS)
+                path = first(row, prefix, _FOLDER_PATH_COLS)
+                user = first(row, prefix, _FOLDER_USER_COLS)
+                if not (host or path or user):
+                    continue
+                password = first(row, prefix, _FOLDER_PASS_COLS)
+                findings.append({
+                    "name": entry_name,
+                    "protocol": label,
+                    "host": host,
+                    "path": path,
+                    "username": user,
+                    "has_password": "yes" if password else "no",
+                })
+        return findings
 
     def _confirm_session(self, target: Target, session: Dict, ctx: ScanContext,
                          location: str) -> Tuple[Optional[bool], str]:

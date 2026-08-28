@@ -13,7 +13,7 @@ Supported today:
 | Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest |
 |---|---|---|---|---|
 | Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin` | Yes (CSV) | Yes |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `fssservice` | Yes (CSV) | Yes |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -26,6 +26,11 @@ Supported today:
   keeps devices that accept any username/password out of the results
 - **Auto-detection**: `--vendor auto` (the default) tries each module until one claims the host
 - **Credential testing**: checks whether devices still carry their factory default logins
+- **Default-credential findings**: flags every default login on the console as it is found and
+  writes a report-ready findings file (`default_credentials.txt`) for the client
+- **Scan-to-folder alerting**: warns when an exported address book holds scan-to-folder (FTP/SMB)
+  destinations, which store reusable service-account credentials for internal shares, and writes
+  them to their own findings file (`scan_to_folder.txt`)
 - **Successful login export**: writes all successful logins to a backtick-delimited file
 - **Address book export**: pulls address books from vulnerable devices (supported vendors)
 - **Unauthenticated harvest**: when default credentials fail, still reads whatever contacts the
@@ -93,6 +98,22 @@ A `302` alone is not treated as proof. The module follows the redirect once with
 session cookie and confirms the page that comes back is not the login form again, so a device
 that redirects on failure cannot produce a false positive.
 
+**More than one privileged login.** The administrator account is not the only factory login. The
+device also ships `/service_login.html` and `/fss_default.html`, which are thin shims that
+redirect to the same `/login.html` form with a different post-login target:
+
+| Shim | Login form requested | Role in `ggt_select(10009)` | Default password |
+|---|---|---|---|
+| `/login.html` | `/login.html?/addressbook.html` | `3` Administrator | `admin` |
+| `/service_login.html` | `/login.html?/service_testpage.html` | `4` Service | `service` |
+| `/fss_default.html` | `/login.html?/fss_default.html` | `7` FSS | `fssservice` |
+
+The exchange is otherwise identical, so the module maps each account's role name to its target
+page (`ROLE_TARGETS`) and reuses the same login flow. The role *value* is read from the form
+rather than hard-coded, since each target page offers only its own role. The Service and FSS
+accounts are technician logins that do not reach System Settings, so they confirm the default
+credential but the address book is still harvested by the unauthenticated scrape.
+
 ### How the Sharp export works
 Sharp does not expose the address book as a data feed behind the list page. It ships a real
 export under **System Settings > Data Import/Export (CSV Format)**, which the module drives in
@@ -158,8 +179,11 @@ count and reports `PARTIAL: Harvested 50 of 137 (stopped on page 2 of 4)` if it 
 short, so a truncated read is never silent.
 
 > **Lockout note:** Sharp MFPs can be configured to lock an account after consecutive failed
-> logins ("A Warning when Login Fails", typically 3 attempts / 5 minutes). Each account in
-> `--accounts` costs one attempt per host, so keep the list short on production fleets.
+> logins ("A Warning when Login Fails", typically 3 attempts / 5 minutes). The counter is
+> per-account, and each account tested costs one attempt per host. The three built-in defaults
+> (`Administrator`, `Service`, `FSS`) are distinct accounts, so a normal run spends one attempt
+> on each - well clear of the threshold. The risk is a long `--accounts` list aimed at the *same*
+> account, so keep those short on production fleets.
 
 ### Target formats
 Targets can be given on the command line, in a file, or both:
@@ -205,6 +229,9 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 - `--output-dir <path>`: output directory for exported address books (default: current directory)
 - `--export-timeout <int>`: timeout in seconds for export requests (default: `30`)
 - `--success-file <path>`: output file for successful logins (default: `successful_logins.txt`)
+- `--findings-file <path>`: output file for default-credential findings (default: `default_credentials.txt`)
+- `--folder-findings-file <path>`: output file for scan-to-folder findings (default: `scan_to_folder.txt`)
+- `--findings-delimiter {backtick,tab}`: field delimiter for the findings files (default: `backtick`)
 - `--verbose`: show all HTTP requests and responses
 
 ### Examples
@@ -271,6 +298,33 @@ Successful logins are written to `--success-file` in backtick-delimited format:
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
 192.0.2.113`192.0.2.113`tcp`443`Successful Sharp MFP login with account 'Administrator' and password admin (HTTP 302)
+```
+
+#### Findings files
+
+Two findings files are written in the same reporting format - `AssetName`, `URI`, `Protocol`,
+`Port`, `Output` - so they drop straight into the client report. The `AssetName` is the same
+`host:port` the successful-logins file uses, which needs to match an existing EngagementAsset.
+Fields are backtick-delimited by default; pass `--findings-delimiter tab` for tab-delimited.
+Each file is written only when it has at least one finding.
+
+`--findings-file` (default `default_credentials.txt`) — one row per device/account still on a
+vendor default. Each one is also printed on the console the moment it is found:
+
+```text
+# Format: AssetName`URI`Protocol`Port`Output
+192.0.2.113`192.0.2.113`tcp`443`Default credentials in use - Sharp MFP accepts account 'Administrator' with default password 'admin'. Change the vendor default to a strong, unique password.
+```
+
+`--folder-findings-file` (default `scan_to_folder.txt`, requires `--export`) — one row per device
+whose exported address book holds scan-to-folder (FTP/SMB) destinations. These store reusable
+credentials so the MFP can drop scans onto an internal share unattended, so each is worth
+reporting on its own. The finding names the destinations and whether a password is stored; the
+password *values* stay in the exported CSV on disk and are never written into the finding:
+
+```text
+# Format: AssetName`URI`Protocol`Port`Output
+192.0.2.113`192.0.2.113`tcp`443`Address book contains 2 scan-to-folder destination(s) storing reusable credentials for internal shares: [FTP] ftp.corp.example/scans (user: svc-scanner, password stored); [SMB] \\SHARESRV\share$ (user: EXAMPLE\svc-printer, password stored). Review whether each is required and rotate the service accounts.
 ```
 
 Exported address books are saved per vendor - `addressbook_ricoh_<host>.txt` for Ricoh's

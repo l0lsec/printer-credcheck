@@ -1,8 +1,11 @@
 # Scan output - never commit results
 successful_logins.txt
+default_credentials.txt
+scan_to_folder.txt
 addressbook_*
 extracted_emails.txt
 extracted_names.txt
+extracted_usernames.txt
 hosts.txt
 
 __pycache__/

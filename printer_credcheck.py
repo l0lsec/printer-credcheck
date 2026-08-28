@@ -97,6 +97,66 @@ def write_lines(path: str, values: List[str], label: str) -> None:
     print(f"Extracted {len(values)} unique {label}(s) to {path}")
 
 
+# The reporting import format shared by both findings files:
+#   AssetName  URI  Protocol  Port  Output
+# AssetName must line up with an existing EngagementAsset; we use the same
+# host:port the successful-logins file uses so the two line up.
+FINDINGS_COLUMNS = ("AssetName", "URI", "Protocol", "Port", "Output")
+
+
+def _one_line(value: str, delimiter: str) -> str:
+    """Keep a field on one line and clear of the column delimiter."""
+    return " ".join(str(value).replace(delimiter, " ").split())
+
+
+def write_findings(path: str, rows: List[Tuple[str, str, str, str, str]],
+                   delimiter: str, label: str) -> None:
+    """Write findings rows in the TAB/backtick delimited EngagementAsset format."""
+    if not rows:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Format: " + delimiter.join(FINDINGS_COLUMNS) + "\n")
+        for asset, uri, protocol, port, output in rows:
+            cols = [_one_line(c, delimiter) for c in (asset, uri, protocol, port, output)]
+            f.write(delimiter.join(cols) + "\n")
+    print(f"{label}: {len(rows)} finding(s) written to {path}")
+
+
+def summarize_folders(target: Target,
+                      folders: List[Dict[str, str]]) -> Tuple[List[str], Tuple[str, str, str, str, str]]:
+    """
+    Turn a device's scan-to-folder destinations into console detail lines and a
+    single findings row summarising them. Passwords are reported as stored or
+    not; their values live only in the exported CSV on disk.
+    """
+    detail_lines: List[str] = []
+    parts: List[str] = []
+    for folder in folders:
+        host = folder.get("host") or ""
+        path = folder.get("path") or ""
+        if host and path:
+            location = f"{host.rstrip('/')}/{path.lstrip('/')}"
+        else:
+            location = host or path or "(destination set)"
+        user = folder.get("username") or "n/a"
+        stored = ", password stored" if folder.get("has_password") == "yes" else ""
+        name = folder.get("name") or "(unnamed)"
+        protocol = folder.get("protocol") or "folder"
+        detail_lines.append(f"[{protocol}] {name}: {location} (user: {user}{stored})")
+        parts.append(f"[{protocol}] {location} (user: {user}{stored})")
+
+    shown = "; ".join(parts[:6])
+    if len(parts) > 6:
+        shown += f"; +{len(parts) - 6} more"
+    output = (
+        f"Address book contains {len(folders)} scan-to-folder destination(s) storing "
+        f"reusable credentials for internal shares: {shown}. Review whether each is "
+        f"required and rotate the service accounts."
+    )
+    row = (target.hostport, target.hostport, "tcp", target.port, output)
+    return detail_lines, row
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Test printers for default credentials and export address books.",
@@ -145,6 +205,15 @@ def main() -> int:
     parser.add_argument("--success-file", default="successful_logins.txt",
                         help="Output file for successful logins, backtick delimited "
                              "(default: successful_logins.txt)")
+    parser.add_argument("--findings-file", default="default_credentials.txt",
+                        help="Output file for default-credential findings, in the "
+                             "AssetName/URI/Protocol/Port/Output report format "
+                             "(default: default_credentials.txt)")
+    parser.add_argument("--folder-findings-file", default="scan_to_folder.txt",
+                        help="Output file for scan-to-folder address book findings, same "
+                             "report format (default: scan_to_folder.txt)")
+    parser.add_argument("--findings-delimiter", choices=["backtick", "tab"], default="backtick",
+                        help="Field delimiter for the findings files (default: backtick)")
 
     args = parser.parse_args()
 
@@ -284,6 +353,11 @@ def main() -> int:
     successes = failures = errors = exported = harvested = 0
     completed = 0
     successful_logins: List[Tuple[str, str, str, str, str]] = []
+    # Default-credential findings: successes against the built-in default
+    # accounts (i.e. not a user-supplied --accounts list), reported so the
+    # client can be told exactly which devices still ship factory logins.
+    default_findings: List[Tuple[str, str, str, str, str]] = []
+    folder_findings: List[Tuple[str, str, str, str, str]] = []
     success_by_host: Dict[str, LoginResult] = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -324,6 +398,25 @@ def main() -> int:
             successful_logins.append(
                 (target.hostport, target.hostport, "tcp", target.port, output_msg)
             )
+
+            # A success against the built-in defaults is a reportable finding:
+            # the device still carries a vendor factory login. Overridden
+            # account lists (--accounts) are a custom password test, not a
+            # default-credential finding, so they are logged but not flagged.
+            if account_override is None:
+                cred_desc = (f"default password '{account.password}'"
+                             if account.password else "a blank password")
+                finding = (
+                    f"Default credentials in use - {module.display_name} accepts account "
+                    f"'{account.label}' with {cred_desc}. Change the vendor default to a "
+                    f"strong, unique password."
+                )
+                default_findings.append(
+                    (target.hostport, target.hostport, "tcp", target.port, finding)
+                )
+                print(f"    ⚠ DEFAULT CREDENTIALS: {target.hostport}  {module.display_name}  "
+                      f"'{account.label}' / {account.password or '<blank>'}")
+
             # Keep the most capable session per host for the harvest stage.
             existing = success_by_host.get(target.hostport)
             if existing is None or (account.can_export and not existing.account.can_export):
@@ -348,9 +441,23 @@ def main() -> int:
                 print(f"{target.hostport}\tEXPORT: {message}")
                 if path:
                     exported += 1
-                    emails, names = module.extract_contacts(read_export(path))
+                    export_text = read_export(path)
+                    emails, names = module.extract_contacts(export_text)
                     all_emails.extend(emails)
                     all_names.extend(names)
+
+                    # Scan-to-folder destinations carry stored FTP/SMB service
+                    # credentials for internal shares - a finding in their own
+                    # right, so surface them loudly and record a report row.
+                    folders = module.extract_scan_to_folder(export_text)
+                    if folders:
+                        detail_lines, row = summarize_folders(target, folders)
+                        folder_findings.append(row)
+                        with_pw = sum(1 for f in folders if f.get("has_password") == "yes")
+                        print(f"{target.hostport}\t⚠ SCAN-TO-FOLDER: {len(folders)} "
+                              f"destination(s) in the address book, {with_pw} with a stored password")
+                        for line in detail_lines:
+                            print(f"    - {line}")
 
             # Fallback: read whatever the device shows without an export. Many
             # Sharp MFPs render their whole address book to anonymous visitors,
@@ -375,6 +482,8 @@ def main() -> int:
                f"\nCredential Tests: {len(jobs)}\tSUCCESS: {successes}\tFAIL: {failures}\tERROR: {errors}")
     if args.export:
         summary += f"\tEXPORTED: {exported}\tHARVESTED: {harvested}"
+    summary += (f"\nFindings\tDefault credentials: {len(default_findings)}"
+                f"\tScan-to-folder: {len(folder_findings)}")
     print(summary)
 
     if successful_logins:
@@ -384,6 +493,18 @@ def main() -> int:
                 f.write(f"{asset_name}`{uri}`{protocol}`{port}`{output_msg}\n")
         print(f"\nSuccessful logins saved to: {args.success_file} "
               f"({len(successful_logins)} entry/entries)")
+
+    # Report-ready findings files. Both use the AssetName/URI/Protocol/Port/Output
+    # format the client's tooling imports; backtick by default, --findings-delimiter
+    # tab to switch. Paths are honoured as given so they can point anywhere.
+    delimiter = "\t" if args.findings_delimiter == "tab" else "`"
+    if default_findings:
+        print()
+        write_findings(args.findings_file, default_findings, delimiter,
+                       "⚠ Default-credential findings")
+    if folder_findings:
+        write_findings(args.folder_findings_file, folder_findings, delimiter,
+                       "⚠ Scan-to-folder findings")
 
     if args.export and (all_emails or all_names):
         emails = sorted(set(all_emails))

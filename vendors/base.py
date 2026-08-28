@@ -111,6 +111,19 @@ class PrinterModule:
         """Return (emails, names) parsed out of an exported address book."""
         return [], []
 
+    def extract_scan_to_folder(self, text: str) -> List[Dict[str, str]]:
+        """
+        Return scan-to-folder destinations found in an exported address book.
+
+        Each entry is a dict with keys: name, protocol (e.g. FTP/SMB), host,
+        path, username, has_password. Devices store these so the MFP can drop
+        scans onto an internal share unattended, which means the row usually
+        carries a reusable service-account credential - a finding worth
+        surfacing on its own. Vendors that do not export folder destinations
+        (or cannot, having only scraped names and e-mail) return an empty list.
+        """
+        return []
+
     def scrape_contacts(self, target: Target, ctx: ScanContext,
                         session: Optional[Dict] = None) -> Tuple[List[str], List[str], str]:
         """
