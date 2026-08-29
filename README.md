@@ -235,6 +235,21 @@ The binary chain fetches up to 128 MB of `/tmp/main/main` per device, because on
 production MX-M6071 firmware the hardcoded strings live at offsets ~43 MB and ~81 MB and
 a smaller cap misses them (verified false-negative during development).
 
+#### Proof-of-concept artifacts
+Every verified row writes a per-device evidence file into `--output-dir` so the
+client can re-open the actual proof without re-running the tool:
+
+| Finding | File | Contents |
+|---|---|---|
+| Pre-auth LFI | `evidence_lfi_<host>_<port>.txt` | Verbatim `/etc/passwd` bytes returned by the device, prefixed with the exact request line and HTTP status |
+| CVE-2024-36248 Google keys | `evidence_google_keys_<host>_<port>.txt` | For each of the four blog-verbatim client IDs found in `/tmp/main/main`, the byte offset plus a 96-byte hex + printable-ASCII window around the match (the surrounding firmware strings are visible, so the match is not confusable with a coincidence) |
+| Hardcoded AWS keys | `evidence_aws_keys_<host>_<port>.txt` | Same shape for the AWS API key, Postman token, and analytics endpoint host |
+
+The finding's Output column names the exact file: `Proof-of-concept saved to
+evidence_google_keys_192.0.2.66_443.txt (offsets + hex + ASCII context around
+each match).` Evidence files are `.gitignore`d so real device data never leaks
+into git.
+
 The FSS User backdoor documented alongside these vulnerabilities is not a separate row in
 `vulnerabilities.txt` - it is the `FSS` / `servicefss` entry in the default-account list, and
 the tool already reports it (with a `SERVICE ACCOUNT DEFAULT` console callout and a row in

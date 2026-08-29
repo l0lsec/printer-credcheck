@@ -92,6 +92,12 @@ class VulnFinding:
     but the module deliberately declines to exploit the condition because
     doing so would crash, reboot, reconfigure, or exfiltrate real user
     credentials from the printer.
+
+    ``evidence_path`` names the file (relative to the run's output_dir) that
+    holds the raw proof-of-concept artifact the finding is based on - the
+    verbatim response body for the LFI, or hex/ASCII excerpts around each
+    matched string for the binary-chain findings. Empty when no on-disk
+    proof was written (advisory rows).
     """
 
     cve: str
@@ -99,6 +105,7 @@ class VulnFinding:
     output: str
     severity: str = "high"      # critical | high | medium | info
     verified: bool = False
+    evidence_path: str = ""
 
 
 class PrinterModule:

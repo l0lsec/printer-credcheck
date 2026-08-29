@@ -23,6 +23,7 @@ Two things make Sharp different from Ricoh:
 import csv
 import html as html_module
 import io
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -287,6 +288,81 @@ def parse_address_table(page: str) -> List[Tuple[str, str, str]]:
 
 def _attrs(blob: str) -> Dict[str, str]:
     return {k.lower(): v for k, v in _ATTR_RE.findall(blob)}
+
+
+def _safe_asset_name(hostport: str) -> str:
+    """Turn '192.0.2.59:443' into a filename-safe token '192.0.2.59_443'."""
+    return hostport.replace(":", "_").replace("/", "_").replace("\\", "_")
+
+
+def _write_evidence(ctx: ScanContext, target: Target, kind: str,
+                    payload: bytes) -> str:
+    """
+    Persist a proof-of-concept artifact to ``<output_dir>/<kind>_<hostport>.txt``
+    and return the relative filename. The client re-opens this file to
+    confirm the finding independently.
+
+    Naming keeps evidence per (host, port) so a device exposed on both 80
+    and 443 gets one file per endpoint rather than clobbering itself.
+    """
+    filename = f"{kind}_{_safe_asset_name(target.hostport)}.txt"
+    path = os.path.join(ctx.output_dir, filename)
+    with open(path, "wb") as f:
+        f.write(payload)
+    return filename
+
+
+def _render_binary_excerpts(target: Target, request_url: str, body: bytes,
+                            matches: List[Tuple[str, int]], subject: str) -> str:
+    """
+    Human-readable proof rendered from a byte-level match in the fetched
+    binary. Includes the request URL that produced the binary, the byte
+    offset of each match, and a 96-byte window around each hit rendered
+    both as hex and as printable ASCII with non-printables shown as '.'.
+
+    The rendering itself is the reproducible artifact: the client can compare
+    the hex/ASCII windows against their own recovery of /tmp/main/main.
+    """
+    window = 48
+    header_lines = [
+        f"# Sharp MFP binary-chain evidence",
+        f"# Subject: {subject}",
+        f"# Target: {target.base_url}",
+        f"# Request: GET {request_url}",
+        f"# Binary length pulled: {len(body)} bytes",
+        f"# Matches: {len(matches)}",
+        "# --- per-match excerpts follow (offset, hex, printable ASCII) ---",
+        "",
+    ]
+    excerpts: List[str] = []
+    for value, offset in matches:
+        start = max(0, offset - window)
+        end = min(len(body), offset + len(value.encode()) + window)
+        chunk = body[start:end]
+        hex_lines = _hexdump(chunk, base=start)
+        excerpts.extend([
+            f"## match: {value}",
+            f"   offset: 0x{offset:x} ({offset})",
+            f"   window: bytes 0x{start:x}..0x{end:x} ({end - start} bytes)",
+            "",
+            hex_lines,
+            "",
+        ])
+    return "\n".join(header_lines + excerpts)
+
+
+def _hexdump(data: bytes, base: int = 0) -> str:
+    """`xxd`-style dump: `offset  <32 hex>  <16 ascii>` per row."""
+    rows: List[str] = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        hex_part = hex_part.ljust(16 * 3 - 1)
+        ascii_part = "".join(
+            chr(b) if 32 <= b < 127 else "." for b in chunk
+        )
+        rows.append(f"{base + i:08x}  {hex_part}  |{ascii_part}|")
+    return "\n".join(rows)
 
 
 class LoginForm:
@@ -1027,45 +1103,66 @@ class SharpModule(PrinterModule):
             return []
 
         findings: List[VulnFinding] = []
-        google_hits = [cid.decode() for cid in GOOGLE_CLIENT_IDS if cid in body]
-        aws_hits: List[str] = []
+        google_hits: List[Tuple[str, int]] = [
+            (cid.decode(), body.find(cid))
+            for cid in GOOGLE_CLIENT_IDS if cid in body
+        ]
+        aws_hits: List[Tuple[str, int]] = []
         for marker in (AWS_API_KEY, AWS_POSTMAN_TOKEN, AWS_ANALYTICS_ENDPOINT):
             if marker in body:
-                aws_hits.append(marker.decode())
+                aws_hits.append((marker.decode(), body.find(marker)))
 
         if google_hits:
+            evidence_path = _write_evidence(
+                ctx, target, "evidence_google_keys",
+                _render_binary_excerpts(
+                    target, url, body, google_hits,
+                    subject="Hardcoded Google OAuth client IDs (CVE-2024-36248)",
+                ).encode("utf-8", errors="replace"),
+            )
             findings.append(VulnFinding(
                 cve="CVE-2024-36248",
                 title="Hardcoded Google OAuth client IDs in the main firmware binary",
                 severity="medium",
                 verified=True,
+                evidence_path=evidence_path,
                 output=(
                     "Verified on this device: fetched /tmp/main/main through the "
                     "pre-auth LFI and matched the following Google OAuth client "
-                    f"ID(s) verbatim in the binary: {'; '.join(google_hits)}. "
+                    f"ID(s) verbatim in the binary: {'; '.join(v for v, _o in google_hits)}. "
                     "The reporter notes these registrations are no longer used by "
                     "Sharp and are free for anyone to claim, so any device attempt "
-                    "to reach them is receivable by an attacker who registers "
-                    f"them. Apply the firmware update per {SHARP_ADVISORY} and "
-                    "block outbound traffic to the listed hosts."
+                    f"to reach them is receivable by an attacker who registers them. "
+                    f"Proof-of-concept saved to {evidence_path} (offsets + hex + ASCII "
+                    f"context around each match). Apply the firmware update per "
+                    f"{SHARP_ADVISORY} and block outbound traffic to the listed hosts."
                 ),
             ))
         if aws_hits:
+            evidence_path = _write_evidence(
+                ctx, target, "evidence_aws_keys",
+                _render_binary_excerpts(
+                    target, url, body, aws_hits,
+                    subject="Hardcoded AWS analytics key/token/endpoint (no-CVE)",
+                ).encode("utf-8", errors="replace"),
+            )
             findings.append(VulnFinding(
                 cve="no-CVE (hardcoded AWS analytics key)",
                 title="Hardcoded AWS API key and analytics endpoint in the main firmware binary",
                 severity="medium",
                 verified=True,
+                evidence_path=evidence_path,
                 output=(
                     "Verified on this device: fetched /tmp/main/main through the "
                     "pre-auth LFI and matched the following hardcoded value(s) "
-                    f"verbatim in the binary: {'; '.join(aws_hits)}. The binary "
-                    "uses these to POST device analytics with 'curl -k' (TLS "
-                    "certificate validation disabled). Any actor who recovers the "
-                    "keys can impersonate a printer or, by MITM'ing the analytics "
-                    "endpoint, receive traffic from every device. Apply the "
-                    f"firmware update per {SHARP_ADVISORY} and block outbound "
-                    "traffic to the listed endpoint."
+                    f"verbatim in the binary: {'; '.join(v for v, _o in aws_hits)}. "
+                    "The binary uses these to POST device analytics with 'curl -k' "
+                    "(TLS certificate validation disabled). Any actor who recovers "
+                    "the keys can impersonate a printer or, by MITM'ing the "
+                    "analytics endpoint, receive traffic from every device. "
+                    f"Proof-of-concept saved to {evidence_path} (offsets + hex + "
+                    "ASCII context around each match). Apply the firmware update per "
+                    f"{SHARP_ADVISORY} and block outbound traffic to the listed endpoint."
                 ),
             ))
         return findings
@@ -1083,6 +1180,9 @@ class SharpModule(PrinterModule):
         specifically do NOT reach for /mnt/log/core-main.log.gz.001 (coredumps
         holding cleartext user passwords) or /mnt/std04/DBMS/uaccnt (user
         credential database), which is where the real attack goes.
+
+        On a hit, the exact response body is persisted to disk as the client's
+        proof-of-concept artifact.
         """
         url = f"{target.base_url}{LFI_PATH}?path={LFI_PROBE_PATH_ARG}"
         headers = {
@@ -1105,11 +1205,28 @@ class SharpModule(PrinterModule):
         if not _LFI_PASSWD_RE.search(body):
             return None
 
+        # Persist the raw /etc/passwd bytes so the client can reproduce the
+        # finding without re-running the tool.
+        evidence_header = (
+            f"# Sharp MFP pre-auth LFI evidence\n"
+            f"# Target: {target.base_url}\n"
+            f"# Request: GET {LFI_PATH}?path={LFI_PROBE_PATH_ARG}\n"
+            f"# Response: HTTP {resp.status_code}, "
+            f"Content-Type: {resp.headers.get('Content-Type', 'unset')}\n"
+            f"# Length: {len(body)} bytes\n"
+            f"# --- verbatim response body follows ---\n"
+        )
+        evidence_path = _write_evidence(
+            ctx, target, "evidence_lfi",
+            (evidence_header + body).encode("utf-8", errors="replace"),
+        )
+
         return VulnFinding(
             cve="no-CVE (pre-auth LFI)",
             title="Unauthenticated arbitrary file read via /installed_emanual_down.html path traversal",
             severity="critical",
             verified=True,
+            evidence_path=evidence_path,
             output=(
                 "Unauthenticated Local File Inclusion confirmed on this device: "
                 f"GET {LFI_PATH}?path={LFI_PROBE_PATH_ARG} returned the printer's "
@@ -1118,9 +1235,10 @@ class SharpModule(PrinterModule):
                 "clear-text passwords for every user account, including Administrator, "
                 "Service and FSS User) and the user database under "
                 "/mnt/std04/DBMS/uaccnt/, so this finding chains directly to full "
-                "credential compromise of the printer. Apply the vendor firmware "
-                f"update per {SHARP_ADVISORY}. Reference: Pierre Kim, "
-                "\"Sharp MFP - 17 vulnerabilities\", 2024-06-27."
+                "credential compromise of the printer. "
+                f"Proof-of-concept saved to {evidence_path} (verbatim response body). "
+                f"Apply the vendor firmware update per {SHARP_ADVISORY}. "
+                "Reference: Pierre Kim, \"Sharp MFP - 17 vulnerabilities\", 2024-06-27."
             ),
         )
 

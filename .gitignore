@@ -5,6 +5,7 @@ scan_to_folder.txt
 priority_followup.txt
 vulnerabilities.txt
 addressbook_*
+evidence_*
 extracted_emails.txt
 extracted_names.txt
 extracted_usernames.txt
