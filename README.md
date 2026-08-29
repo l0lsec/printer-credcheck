@@ -1,8 +1,10 @@
 ## printer-credcheck
 
 ### Overview
-Tests network printers and MFPs for vendor default credentials, and exports address books
-from devices that still have them. Point it at a host, a file of hosts, or a whole subnet.
+Tests network printers and MFPs for vendor default credentials, exports address books from
+devices that still have them, and recovers the credentials those devices store for other
+systems - scan-to-folder service accounts and LDAP binds - in cleartext. Point it at a host, a
+file of hosts, or a whole subnet.
 
 The tool is vendor-agnostic: each printer family lives in its own module under `vendors/`.
 Every endpoint is port probed and fingerprinted before a single credential is sent, so
@@ -10,10 +12,10 @@ unrelated HTTP services on the range are identified and skipped rather than logg
 
 Supported today:
 
-| Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest | Published-CVE checks |
-|---|---|---|---|---|---|
-| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No | No |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes | Yes (3 verified, zero-FP by default) |
+| Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest | Published-CVE checks | Credential recovery |
+|---|---|---|---|---|---|---|
+| Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No | No | No |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes | Yes (3 verified, zero-FP by default) | Yes (scan-to-folder, LDAP, device accounts) |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -28,9 +30,16 @@ Supported today:
 - **Credential testing**: checks whether devices still carry their factory default logins
 - **Default-credential findings**: flags every default login on the console as it is found and
   writes a report-ready findings file (`default_credentials.txt`) for the client
-- **Scan-to-folder alerting**: warns when an exported address book holds scan-to-folder (FTP/SMB)
-  destinations, which store reusable service-account credentials for internal shares, and writes
-  them to their own findings file (`scan_to_folder.txt`)
+- **Scan-to-folder alerting**: warns when an exported address book holds scan-to-folder
+  (FTP/SMB/Desktop) destinations, which store reusable service-account credentials for internal
+  shares, and writes them to their own findings file (`scan_to_folder.txt`)
+- **Credential recovery**: recovers the stored secrets in cleartext rather than just reporting
+  that the device holds them - scan-to-folder FTP/SMB/Desktop passwords out of the exported CSV
+  and LDAP bind credentials off the settings pages. Written to `recovered_credentials.txt`;
+  disable with `--no-recover-secrets`
+- **Device memory recovery** (opt-in, `--dump-coredumps`): reads account passwords out of the
+  printer's world-readable coredumps through the pre-auth LFI, which is what recovers credentials
+  from devices whose defaults have already been changed
 - **Priority follow-up**: devices that have both a technician-level service account default *and*
   scan-to-folder destinations are flagged separately in `priority_followup.txt` — these combine
   default credentials with stored network credentials and should be remediated first
@@ -63,7 +72,9 @@ Supported today:
 3. **Fingerprint** — every listening service is matched against the enabled vendor modules.
    Only a positive match moves on.
 4. **Test credentials** — the matched vendor's default accounts, and nothing else.
-5. **Check published CVEs** — for vendor modules that ship one (Sharp today), run
+5. **Recover stored credentials** — pull the device's stored secrets back out in cleartext
+   (skip with `--no-recover-secrets`; add `--dump-coredumps` for the memory source).
+6. **Check published CVEs** — for vendor modules that ship one (Sharp today), run
    active on-device probes and emit only rows that were actually confirmed. Pass
    `--include-advisories` to also emit the fingerprint-based advisory rows for
    CVEs that cannot be safely verified without an exploit. Disable with
@@ -245,6 +256,9 @@ client can re-open the actual proof without re-running the tool:
 | CVE-2024-36248 Google keys | `evidence_google_keys_<host>_<port>.txt` | For each of the four blog-verbatim client IDs found in `/tmp/main/main`, the byte offset plus a 96-byte hex + printable-ASCII window around the match (the surrounding firmware strings are visible, so the match is not confusable with a coincidence) |
 | Hardcoded AWS keys | `evidence_aws_keys_<host>_<port>.txt` | Same shape for the AWS API key, Postman token, and analytics endpoint host |
 
+Credential recovery writes its own artifact alongside these - see
+[Recovering stored credentials](#recovering-stored-credentials).
+
 The finding's Output column names the exact file: `Proof-of-concept saved to
 evidence_google_keys_192.0.2.66_443.txt (offsets + hex + ASCII context around
 each match).` Evidence files are `.gitignore`d so real device data never leaks
@@ -254,6 +268,89 @@ The FSS User backdoor documented alongside these vulnerabilities is not a separa
 `vulnerabilities.txt` - it is the `FSS` / `servicefss` entry in the default-account list, and
 the tool already reports it (with a `SERVICE ACCOUNT DEFAULT` console callout and a row in
 `default_credentials.txt`) whenever the hidden account still accepts its factory password.
+
+### Recovering stored credentials
+
+Knowing that a printer *holds* a scan-to-folder or LDAP bind password is only half a finding.
+The credential is a real account on the client's network - a scan-to-folder destination exists
+so the MFP can write into a share unattended, which means the account is real, it is usually a
+service account, and it usually has write access. This stage recovers the value.
+
+Three independent sources run per device, cheapest first. A device that blocks one still gives
+up the others:
+
+| # | Source | Needs | Recovers |
+|---|---|---|---|
+| 1 | The address book CSV already pulled in the harvest stage | Administrator default still works | FTP / SMB / Desktop scan-to-folder passwords |
+| 2 | The LDAP settings pages, `/nw_ldap_entry.html?ldapid=N` | Administrator default still works | Directory server, bind DN, and the bind password on firmware that renders it back into the form |
+| 3 | The printer's coredumps, through the pre-auth LFI | Nothing - no login at all. **Opt-in: `--dump-coredumps`** | Account passwords, LDAP binds, and folder credentials in cleartext |
+
+Sources 1 and 2 run by default because they re-read configuration the scan has already
+downloaded, and they return only the credentials the device was deliberately configured to
+store. Source 3 is gated behind `--dump-coredumps` because it does something different in kind:
+it returns whatever passwords are resident in the printer's memory, including those of users who
+merely logged in. A routine subnet sweep should not produce a file full of a client's account
+passwords unless someone decided to go after them.
+
+Source 3 is the one that matters when the defaults have already been changed. Per the advisory,
+`/mnt/log` holds gzipped, world-readable (`-rw-r--r--`) coredumps of the main binary, and that
+binary keeps credentials in the clear - the reporter recovered an administrator password *"even
+when the admin user has not been logged-in the printer since the printer booted"*. The main
+binary is also the web server, so the form POST bodies it processed are resident in the same
+dump, which is what makes the strongest hits here structured rather than guessed:
+
+```text
+GET /installed_emanual_down.html?path=/manual/../../../mnt/log/core-main.log.gz.001
+-> ggt_select(10009)=3&ggt_textbox(10003)=ExampleP%40ss2&action=loginbtn
+                       ^^^^^^^^^^^^^^^^^ the device's own password field, so this is a
+                                         submitted password, not a pattern that resembles one
+```
+
+The stage only runs after the `/etc/passwd` probe confirms traversal works, so a patched device
+costs one small request rather than a multi-megabyte download. Coredumps are gzip and are split
+into numbered parts (`core-main.log.gz.001` was 17,316,455 bytes on the reporter's MX-M6071);
+the download is capped by `--recovery-max-bytes` and a truncated stream is inflated as far as it
+goes rather than discarded.
+
+#### Confidence
+
+Every recovered credential is labelled, and the label is written into the report row:
+
+- **`[verified]`** — the value came out of a field whose meaning is unambiguous: a CSV password
+  column, a settings form field, or a form POST body recovered verbatim from memory with the
+  device's own field name attached. It is a credential.
+- **`[candidate]`** — the value came from a `<something>password=<value>` match over
+  unstructured memory. Very likely a credential, not proven to be one. The account and host
+  attached to it are the nearest ones in the dump, which is an association by proximity - check
+  the byte offset in the evidence file before quoting it in a report.
+- **`[config-only]`** — the account and where it points were recovered, the password was not.
+  Typical of an LDAP settings page that masks the stored bind password. When another source
+  later produces that same account's password, the two rows are merged into one.
+
+#### Encoding
+
+Sharp's CSV export declares an encoding per credential field in a companion column
+(`ftp-password` is described by `ftp-password/@encodingMethod`), because the same file has to
+round-trip values that are not valid CSV text. Base64 and hex are decoded; an encoding the tool
+does not know is reported verbatim with a note saying so, since a password you have to decode by
+hand still beats being told nothing was found.
+
+#### Output
+
+Recovered credentials go to `--creds-file` (default `recovered_credentials.txt`) in the same
+`AssetName`/`URI`/`Protocol`/`Port`/`Output` format as the other findings files, one row per
+credential, plus a per-device evidence file:
+
+| File | Contents |
+|---|---|
+| `recovered_credentials.txt` | One report row per credential: kind, confidence, username, password, where it is valid, how it was recovered |
+| `evidence_recovered_credentials_<host>_<port>.txt` | The memory-recovered credentials with the byte offset each was found at and the request that produced the dump |
+
+> **These files hold live credentials for someone else's network.** Both are `.gitignore`d.
+> Keep them with the engagement evidence and destroy them at close. `scan_to_folder.txt`
+> deliberately stays a summary - it names each destination and whether its password came back,
+> and leaves the secret itself to the credential file - so it can go into the report body
+> without carrying live secrets through it.
 
 ### Target formats
 Targets can be given on the command line, in a file, or both:
@@ -308,6 +405,15 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 - `--include-advisories`: also emit advisory-only rows for CVEs this tool cannot safely
   actively test (CVE-2024-28038, CVE-2022-45796, CVE-2024-34162). Off by default so
   `vulnerabilities.txt` is zero-false-positive
+- `--no-recover-secrets`: skip the credential recovery stage (scan-to-folder passwords from the
+  export, LDAP bind credentials, and coredump recovery)
+- `--dump-coredumps`: also recover credentials from the device's raw memory — downloads the
+  printer's world-readable coredumps through the pre-auth LFI and reads cleartext passwords out
+  of them. Off by default; needed to recover credentials from devices whose defaults were changed
+- `--creds-file <path>`: output file for recovered credentials — contains live cleartext secrets
+  (default: `recovered_credentials.txt`)
+- `--recovery-max-bytes <int>`: ceiling on a single credential-recovery download, e.g. a printer
+  coredump (default: `67108864`)
 - `--findings-delimiter {backtick,tab}`: field delimiter for the findings files (default: `backtick`)
 - `--verbose`: show all HTTP requests and responses
 
@@ -353,6 +459,32 @@ python3 printer_credcheck.py 10.10.62.0/24 --no-export --no-vuln-checks
 python3 printer_credcheck.py ./hosts.txt --vendor sharp --accounts 'Administrator:admin,Administrator:sharp'
 ```
 
+#### Recover the credentials a fleet has stored
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --output-dir ./engagement
+```
+Runs by default: scan-to-folder and LDAP credentials come back from devices whose defaults still
+work.
+
+#### Also recover credentials from device memory
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --dump-coredumps --output-dir ./engagement
+```
+Adds the coredump source, which recovers account passwords from any device with the pre-auth
+LFI — including devices whose defaults were changed, where nothing else works. This downloads
+the printer's memory and reads every password in it, so use it when the engagement calls for it
+rather than as a default.
+
+#### Skip credential recovery (findings only, no secrets on disk)
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --no-recover-secrets
+```
+
+#### Cap the coredump download on a large fleet
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --recovery-max-bytes 16777216
+```
+
 #### See what each vendor module will send
 ```bash
 python3 printer_credcheck.py --list-vendors
@@ -370,7 +502,7 @@ python3 printer_credcheck.py 10.10.62.0/24 --no-vuln-checks
 
 ### Output
 
-The scan runs in five stages:
+The scan runs in six stages:
 1. **Step 1** — expand the targets and port sweep them for listening HTTP services
 2. **Step 2** — fingerprint every live service and assign it to a vendor module (or skip it)
 3. **Step 3** — test that vendor's default accounts
@@ -380,6 +512,10 @@ The scan runs in five stages:
    fingerprint-based advisory rows; skip the whole stage with `--no-vuln-checks`)
 5. **Step 4** — harvest address books, by export where the credentials worked and by
    unauthenticated read where they did not (skipped with `--no-export`)
+6. **Step 4.5** — recover stored credentials in cleartext: scan-to-folder passwords out of the
+   exported CSV and LDAP bind credentials off the settings pages, plus — with `--dump-coredumps`
+   — account passwords out of the device's coredumps through the pre-auth LFI (skip the whole
+   stage with `--no-recover-secrets`)
 
 Skipped endpoints are counted rather than listed; pass `--show-skipped` to see each one and
 the reason every module rejected it.
@@ -393,7 +529,7 @@ Successful logins are written to `--success-file` in backtick-delimited format:
 
 #### Findings files
 
-Up to four findings files are written in the same reporting format - `AssetName`, `URI`,
+Up to five findings files are written in the same reporting format - `AssetName`, `URI`,
 `Protocol`, `Port`, `Output` - so they drop straight into the client report. The `AssetName`
 is the same `host:port` the successful-logins file uses, which needs to match an existing
 EngagementAsset. Fields are backtick-delimited by default; pass `--findings-delimiter tab`
@@ -411,15 +547,31 @@ regular administrator defaults:
 ```
 
 `--folder-findings-file` (default `scan_to_folder.txt`, skipped under `--no-export`) — one row per device
-whose exported address book holds scan-to-folder (FTP/SMB) destinations. These store reusable
+whose exported address book holds scan-to-folder (FTP/SMB/Desktop) destinations. These store reusable
 credentials so the MFP can drop scans onto an internal share unattended, so each is worth
-reporting on its own. The finding names the destinations and whether a password is stored; the
-password *values* stay in the exported CSV on disk and are never written into the finding:
+reporting on its own. This row stays a summary: it names the destinations and says whether each
+password came back, and leaves the values to `recovered_credentials.txt`, so it can go into the
+report body without carrying live credentials through it:
 
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
-192.0.2.113`192.0.2.113`tcp`443`Address book contains 2 scan-to-folder destination(s) storing reusable credentials for internal shares: [FTP] ftp.corp.example/scans (user: svc-scanner, password stored); [SMB] \\SHARESRV\share$ (user: EXAMPLE\svc-printer, password stored). Review whether each is required and rotate the service accounts.
+192.0.2.113`192.0.2.113`tcp`443`Address book contains 2 scan-to-folder destination(s) storing reusable credentials for internal shares: [FTP] ftp.corp.example/scans (user: svc-scanner, password recovered); [SMB] \\SHARESRV\share$ (user: EXAMPLE\svc-printer, password recovered). Review whether each is required and rotate the service accounts.
 ```
+
+`--creds-file` (default `recovered_credentials.txt`, skipped under `--no-recover-secrets`) — one
+row per credential recovered in cleartext, from any of the three sources described under
+[Recovering stored credentials](#recovering-stored-credentials). The confidence label is written
+into the Output column so the client's tooling can filter on it, and the row names the evidence
+file the value came from:
+
+```text
+# Format: AssetName`URI`Protocol`Port`Output
+192.0.2.113`192.0.2.113`tcp`443`Recovered scan-to-folder credential [verified]: username 'EXAMPLE\svc-scanner'. password 'ExampleP@ss1'. valid for \\SHARESRV\share$. Source: SMB destination in the address book CSV exported through System Settings > Data Import/Export on 192.0.2.113:443. address book entry 'Scan to Finance'; stored with encodingMethod=base64. Rotate this account and remove the stored credential from the device.
+192.0.2.113`192.0.2.113`tcp`443`Recovered device account credential [verified]: username 'Administrator'. password 'ExampleP@ss2'. valid for 192.0.2.113:443. Source: login form POST body recovered cleartext in core-main.log.gz.001 read through the pre-auth LFI on 192.0.2.113:443. matched ggt_textbox(10003)= at offset 0x79ea; role selection Administrator. Evidence: evidence_recovered_credentials_192.0.2.113_443.txt. Rotate this account and remove the stored credential from the device.
+```
+
+**This file holds live credentials.** It is `.gitignore`d; keep it with the engagement evidence
+and destroy it at close.
 
 `--priority-file` (default `priority_followup.txt`, skipped under `--no-export`) — one row per device
 that has **both** a technician-level service account default (Service/FSS) **and** scan-to-folder

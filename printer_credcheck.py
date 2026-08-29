@@ -20,7 +20,8 @@ from typing import Dict, List, Optional, Tuple
 
 import discovery
 import vendors
-from vendors.base import Account, LoginResult, PrinterModule, ScanContext, Target, VulnFinding
+from vendors.base import (Account, LoginResult, PrinterModule, RecoveredCredential,
+                          ScanContext, Target, VulnFinding)
 
 
 def parse_accounts(spec: str) -> List[Account]:
@@ -126,8 +127,12 @@ def summarize_folders(target: Target,
                       folders: List[Dict[str, str]]) -> Tuple[List[str], Tuple[str, str, str, str, str]]:
     """
     Turn a device's scan-to-folder destinations into console detail lines and a
-    single findings row summarising them. Passwords are reported as stored or
-    not; their values live only in the exported CSV on disk.
+    single findings row summarising them.
+
+    This row stays a summary: it names each destination and whether its
+    password came back, and leaves the secret itself to the recovered-
+    credentials file, so the scan-to-folder findings can go into the report
+    body without carrying live credentials through it.
     """
     detail_lines: List[str] = []
     parts: List[str] = []
@@ -139,7 +144,12 @@ def summarize_folders(target: Target,
         else:
             location = host or path or "(destination set)"
         user = folder.get("username") or "n/a"
-        stored = ", password stored" if folder.get("has_password") == "yes" else ""
+        if folder.get("password"):
+            stored = ", password recovered"
+        elif folder.get("has_password") == "yes":
+            stored = ", password stored"
+        else:
+            stored = ""
         name = folder.get("name") or "(unnamed)"
         protocol = folder.get("protocol") or "folder"
         detail_lines.append(f"[{protocol}] {name}: {location} (user: {user}{stored})")
@@ -228,6 +238,22 @@ def main() -> int:
                              "actively test without crashing or reconfiguring the device "
                              "(CVE-2024-28038, CVE-2022-45796, CVE-2024-34162). Off by "
                              "default so the vulnerabilities.txt output is zero-false-positive")
+    parser.add_argument("--no-recover-secrets", action="store_true",
+                        help="Skip credential recovery (scan-to-folder passwords from the "
+                             "export, LDAP bind credentials, and coredump recovery)")
+    parser.add_argument("--dump-coredumps", action="store_true",
+                        help="Also recover credentials from the device's raw memory - "
+                             "downloads the printer's world-readable coredumps through the "
+                             "pre-auth LFI and reads cleartext passwords out of them. Off by "
+                             "default: this returns every account password resident in memory, "
+                             "not just the ones the device was configured to store. Needed to "
+                             "recover credentials from devices whose defaults were changed")
+    parser.add_argument("--creds-file", default="recovered_credentials.txt",
+                        help="Output file for recovered credentials - contains live "
+                             "cleartext secrets (default: recovered_credentials.txt)")
+    parser.add_argument("--recovery-max-bytes", type=int, default=64 * 1024 * 1024,
+                        help="Ceiling on a single credential-recovery download, e.g. a "
+                             "printer coredump (default: 67108864)")
     parser.add_argument("--findings-delimiter", choices=["backtick", "tab"], default="backtick",
                         help="Field delimiter for the findings files (default: backtick)")
 
@@ -286,6 +312,7 @@ def main() -> int:
         verify_tls=args.verify,
         verbose=args.verbose,
         output_dir=args.output_dir,
+        recovery_max_bytes=args.recovery_max_bytes,
     )
 
     # ---- Stage 1: find HTTP services -----------------------------------
@@ -500,6 +527,7 @@ def main() -> int:
     # ---- Stage 4: harvest address books --------------------------------
     all_emails: List[str] = []
     all_names: List[str] = []
+    export_by_host: Dict[str, str] = {}
 
     if not args.no_export:
         print(f"\n{'-' * 80}")
@@ -517,6 +545,7 @@ def main() -> int:
                 if path:
                     exported += 1
                     export_text = read_export(path)
+                    export_by_host[target.hostport] = export_text
                     emails, names = module.extract_contacts(export_text)
                     all_emails.extend(emails)
                     all_names.extend(names)
@@ -556,6 +585,65 @@ def main() -> int:
                 if emails or names:
                     harvested += 1
 
+    # ---- Stage 4.5: recover stored credentials -------------------------
+    # Knowing a printer holds a scan-to-folder or LDAP bind password is only
+    # half a finding - the credential is a real account on the client's
+    # network. This stage recovers the value: out of the address book CSV we
+    # already exported, off the LDAP settings pages with the session we
+    # already have, and - for devices whose defaults were changed - out of the
+    # printer's world-readable coredumps through the pre-auth LFI.
+    credential_rows: List[Tuple[str, str, str, str, str]] = []
+    recovered_creds = 0
+    if not args.no_recover_secrets:
+        recovery_targets = [(t, m) for t, m in identified if m.supports_credential_recovery]
+        if recovery_targets:
+            print(f"\n{'-' * 80}")
+            print(f"Step 4.5: Recovering stored credentials from {len(recovery_targets)} printer(s)")
+            if args.dump_coredumps:
+                print("  Including device memory: coredumps will be downloaded and read")
+            else:
+                print("  Configured destinations only. Devices whose defaults were changed need "
+                      "--dump-coredumps to give up credentials")
+            print("-" * 80)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(module.recover_credentials, target, ctx,
+                                    success_by_host.get(target.hostport),
+                                    export_by_host.get(target.hostport, ""),
+                                    args.dump_coredumps): (target, module)
+                    for target, module in recovery_targets
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    target, module = futures[future]
+                    try:
+                        found: List[RecoveredCredential] = future.result()
+                    except Exception as exc:
+                        print(f"{target.hostport}\tRECOVERY ERROR: "
+                              f"{exc.__class__.__name__}: {exc}")
+                        continue
+                    for cred in found:
+                        symbol = "⚠⚠" if cred.confidence == "verified" else "⚠"
+                        shown = cred.password if cred.password else "(not recovered)"
+                        print(f"{symbol} CREDENTIAL [{cred.kind}] [{cred.confidence}] "
+                              f"{target.hostport}\t{cred.label}\tpassword: {shown}")
+                        if cred.password:
+                            recovered_creds += 1
+                        parts = [
+                            f"Recovered {cred.kind} credential [{cred.confidence}]: "
+                            f"username '{cred.username}'",
+                            f"password '{cred.password}'" if cred.password
+                            else "password not recovered from this source",
+                            f"valid for {cred.scope}" if cred.scope else "",
+                            f"Source: {cred.source}",
+                            cred.detail,
+                            f"Evidence: {cred.evidence_path}" if cred.evidence_path else "",
+                            "Rotate this account and remove the stored credential from the device.",
+                        ]
+                        credential_rows.append(
+                            (target.hostport, target.hostport, "tcp", target.port,
+                             ". ".join(part for part in parts if part))
+                        )
+
     # Priority follow-up: devices that have BOTH a service account default
     # AND scan-to-folder destinations — the combination means a technician
     # login can reach stored credentials for internal shares.
@@ -583,6 +671,9 @@ def main() -> int:
     summary += (f"\nFindings\tDefault credentials: {len(default_findings)}"
                 f"\tScan-to-folder: {len(folder_findings)}"
                 f"\tPriority follow-up: {len(priority_findings)}")
+    if not args.no_recover_secrets:
+        summary += (f"\tRecovered credentials: {len(credential_rows)} "
+                    f"({recovered_creds} with a password)")
     if not args.no_vuln_checks:
         summary += (f"\tVulnerabilities: {len(vuln_findings_rows)} "
                     f"({verified_vulns} verified)")
@@ -610,6 +701,10 @@ def main() -> int:
     if priority_findings:
         write_findings(args.priority_file, priority_findings, delimiter,
                        "⚠⚠⚠ Priority follow-up findings")
+    if credential_rows:
+        write_findings(args.creds_file, credential_rows, delimiter,
+                       f"⚠⚠ Recovered credentials ({recovered_creds} with a password) "
+                       f"- LIVE SECRETS, handle as engagement evidence")
     if vuln_findings_rows:
         label = (f"⚠ Vulnerability findings ({verified_vulns} verified, "
                  f"{len(vuln_findings_rows) - verified_vulns} advisory)")

@@ -64,6 +64,11 @@ class ScanContext:
     verify_tls: bool = False
     verbose: bool = False
     output_dir: str = "."
+    # Ceiling for a single credential-recovery artifact (a printer coredump is
+    # tens of MB compressed). Separate from MAX_BODY_BYTES because that limit
+    # exists to stop a stray HTTP service from eating memory, whereas this one
+    # is a deliberate, operator-tunable budget for a file we mean to download.
+    recovery_max_bytes: int = 64 * 1024 * 1024
 
 
 @dataclass
@@ -108,6 +113,45 @@ class VulnFinding:
     evidence_path: str = ""
 
 
+@dataclass
+class RecoveredCredential:
+    """A username/password pair read back off a device.
+
+    This is the difference between *knowing* a device stores a credential and
+    *having* it. ``kind`` says what the credential unlocks - a scan-to-folder
+    share, an LDAP bind, or an account on the printer itself - and ``scope``
+    says where it is valid, so the row is actionable without re-reading the
+    device.
+
+    ``confidence`` follows the same discipline as VulnFinding.verified:
+
+      * ``verified``  - the value came out of a structured field whose meaning
+        is unambiguous (a CSV password column, a settings form field, a form
+        POST body recovered verbatim from memory). It is a credential.
+      * ``candidate`` - the value came from a pattern match over unstructured
+        bytes (a memory dump grep). It is very likely a credential but the
+        surrounding structure did not prove it, so it is labelled rather than
+        silently mixed in with the proven ones.
+
+    Nothing here is ever written to a shared console line by default: these
+    are live credentials for someone else's network.
+    """
+
+    kind: str                   # scan-to-folder | LDAP | device account
+    scope: str                  # where it works: //server/share, ldap://host:389, the device
+    username: str
+    password: str
+    source: str                 # how it was recovered, for the report's Output field
+    detail: str = ""
+    evidence_path: str = ""
+    confidence: str = "verified"    # verified | candidate
+
+    @property
+    def label(self) -> str:
+        user = self.username or "(no username)"
+        return f"{user}@{self.scope}" if self.scope else user
+
+
 class PrinterModule:
     """Base class for a vendor implementation."""
 
@@ -117,6 +161,7 @@ class PrinterModule:
     supports_export = False
     supports_scrape = False
     supports_vuln_checks = False
+    supports_credential_recovery = False
     export_note = ""
 
     # ---- required ------------------------------------------------------
@@ -179,6 +224,33 @@ class PrinterModule:
 
         Pass ``include_advisories=True`` to opt back in to those rows for
         internal triage. Modules that don't implement this return [].
+        """
+        return []
+
+    def recover_credentials(self, target: Target, ctx: ScanContext,
+                            login_result: Optional["LoginResult"] = None,
+                            export_text: str = "",
+                            include_coredumps: bool = False) -> List["RecoveredCredential"]:
+        """
+        Read stored credentials back off the device in cleartext.
+
+        Detecting that a printer holds a scan-to-folder or LDAP bind password
+        is only half the finding: the credential is a real service account on
+        the client's network, and demonstrating that it can be recovered is
+        what turns "the printer stores a password" into "the printer hands out
+        a domain service account". This method does that recovery.
+
+        ``export_text`` is the address book CSV already pulled in the harvest
+        stage, passed in so a module can mine it without a second export.
+
+        ``include_coredumps`` gates the sources that read the device's raw
+        memory. Those return every account's password rather than the ones
+        stored for a configured destination, so they are opt-in: a routine
+        sweep should not produce a file full of a client's account passwords
+        unless someone asked it to. Sources that only re-read configuration
+        the scan already downloaded run either way.
+
+        Modules that cannot recover anything return [].
         """
         return []
 
@@ -262,6 +334,23 @@ def log_response(ctx: ScanContext, tag: str, hostport: str, resp, body_limit: in
     if len(text) > body_limit:
         print("... (truncated)")
     print(f"{RULE}\n")
+
+
+_PRINTABLE_RUN_RE = re.compile(rb"[\x20-\x7e]{4,}")
+
+
+def printable_strings(data: bytes, min_len: int = 4):
+    """
+    The equivalent of `strings(1)` over a blob, yielding (offset, text).
+
+    Used to pull readable material out of firmware binaries and coredumps.
+    Yields rather than building a list because the inputs are tens of MB and
+    callers filter almost everything out.
+    """
+    for match in _PRINTABLE_RUN_RE.finditer(data):
+        run = match.group()
+        if len(run) >= min_len:
+            yield match.start(), run.decode("ascii", errors="replace")
 
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)

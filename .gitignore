@@ -19,3 +19,6 @@ GATES.md
 
 __pycache__/
 *.pyc
+
+# Recovered credentials - live secrets, never commit
+recovered_credentials.txt
