@@ -122,10 +122,11 @@ ADDRESS_BOOK_PATH = "/addressbook.html"
 # relative to /mnt/std_data, so a traversal of ../../../ hits the root of the
 # printer's filesystem. /etc/passwd is small, harmless, always present, and
 # unmistakable: a real device answers with a line starting root:...:0:0:. We
-# use that as the safest possible confirmation - it does not touch coredumps
-# (which carry cleartext user passwords) or the /mnt/std04/DBMS/uaccnt
-# configuration files (which are the pentester's real prize but also real
-# user data that we have no reason to persist in this scanner's output).
+# use that as the safest possible confirmation for the vulnerability check
+# itself: the probe proves traversal works without reading anything sensitive.
+# The coredumps under /mnt/log (cleartext user passwords) and the account
+# database under /mnt/std04/DBMS/uaccnt are read by the credential recovery
+# stage instead, and only when the operator opts in with --dump-coredumps.
 LFI_PATH = "/installed_emanual_down.html"
 LFI_PROBE_PATH_ARG = "/manual/../../../etc/passwd"
 _LFI_PASSWD_RE = re.compile(r"^root:[^:\n]*:0:0:", re.M)
@@ -1525,10 +1526,11 @@ class SharpModule(PrinterModule):
         segments preceding /manual/. ``GET /installed_emanual_down.html?path=
         /manual/../../../etc/passwd`` returns the printer's Linux passwd file
         without a session cookie. We probe with /etc/passwd because it is small,
-        harmless, unmistakably formatted, and never contains user data - we
-        specifically do NOT reach for /mnt/log/core-main.log.gz.001 (coredumps
-        holding cleartext user passwords) or /mnt/std04/DBMS/uaccnt (user
-        credential database), which is where the real attack goes.
+        harmless, unmistakably formatted, and never contains user data. Proving
+        the vulnerability is all this check does: /mnt/log/core-main.log.gz.001
+        (coredumps holding cleartext user passwords) and /mnt/std04/DBMS/uaccnt
+        (the user credential database) are where the attack actually goes, and
+        reading them belongs to recover_credentials(), behind --dump-coredumps.
 
         On a hit, the exact response body is persisted to disk as the client's
         proof-of-concept artifact.

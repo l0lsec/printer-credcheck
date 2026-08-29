@@ -1,8 +1,10 @@
 ## printer-credcheck
 
 ### Overview
-Tests network printers and MFPs for vendor default credentials, and exports address books
-from devices that still have them. Point it at a host, a file of hosts, or a whole subnet.
+Tests network printers and MFPs for vendor default credentials, exports address books from
+devices that still have them, and recovers the credentials those devices store for other
+systems - scan-to-folder service accounts and LDAP binds - in cleartext. Point it at a host, a
+file of hosts, or a whole subnet.
 
 The tool is vendor-agnostic: each printer family lives in its own module under `vendors/`.
 Every endpoint is port probed and fingerprinted before a single credential is sent, so
@@ -253,6 +255,9 @@ client can re-open the actual proof without re-running the tool:
 | Pre-auth LFI | `evidence_lfi_<host>_<port>.txt` | Verbatim `/etc/passwd` bytes returned by the device, prefixed with the exact request line and HTTP status |
 | CVE-2024-36248 Google keys | `evidence_google_keys_<host>_<port>.txt` | For each of the four blog-verbatim client IDs found in `/tmp/main/main`, the byte offset plus a 96-byte hex + printable-ASCII window around the match (the surrounding firmware strings are visible, so the match is not confusable with a coincidence) |
 | Hardcoded AWS keys | `evidence_aws_keys_<host>_<port>.txt` | Same shape for the AWS API key, Postman token, and analytics endpoint host |
+
+Credential recovery writes its own artifact alongside these - see
+[Recovering stored credentials](#recovering-stored-credentials).
 
 The finding's Output column names the exact file: `Proof-of-concept saved to
 evidence_google_keys_192.0.2.66_443.txt (offsets + hex + ASCII context around
