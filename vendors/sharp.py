@@ -1595,7 +1595,8 @@ class SharpModule(PrinterModule):
 
     def recover_credentials(self, target: Target, ctx: ScanContext,
                             login_result: Optional[LoginResult] = None,
-                            export_text: str = "") -> List[RecoveredCredential]:
+                            export_text: str = "",
+                            include_coredumps: bool = False) -> List[RecoveredCredential]:
         """
         Recover the credentials this device stores, in cleartext.
 
@@ -1614,7 +1615,11 @@ class SharpModule(PrinterModule):
              June 2024 advisory these are world-readable under /mnt/log and
              hold cleartext passwords for every account. This is the source
              that still works when the default credentials have been changed
-             and no session was obtained at all.
+             and no session was obtained at all - and the reason it is
+             ``include_coredumps``-gated: sources 1 and 2 read back a
+             credential the device was configured to store, while this one
+             returns whatever passwords happen to be resident in memory,
+             including those of users who merely logged in.
 
         Every returned credential is labelled ``verified`` (it came out of a
         field whose meaning is unambiguous), ``candidate`` (a pattern match
@@ -1623,11 +1628,14 @@ class SharpModule(PrinterModule):
         """
         recovered: List[RecoveredCredential] = []
 
-        for stage in (
+        stages = [
             lambda: self._recover_from_export(target, export_text),
             lambda: self._recover_ldap_settings(target, ctx, login_result),
-            lambda: self._recover_from_memory(target, ctx),
-        ):
+        ]
+        if include_coredumps:
+            stages.append(lambda: self._recover_from_memory(target, ctx))
+
+        for stage in stages:
             try:
                 recovered.extend(stage())
             except Exception as exc:

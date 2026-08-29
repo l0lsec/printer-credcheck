@@ -32,10 +32,12 @@ Supported today:
   (FTP/SMB/Desktop) destinations, which store reusable service-account credentials for internal
   shares, and writes them to their own findings file (`scan_to_folder.txt`)
 - **Credential recovery**: recovers the stored secrets in cleartext rather than just reporting
-  that the device holds them - scan-to-folder FTP/SMB/Desktop passwords out of the exported CSV,
-  LDAP bind credentials off the settings pages, and, on devices whose defaults have already been
-  changed, account passwords out of the printer's world-readable coredumps through the pre-auth
-  LFI. Written to `recovered_credentials.txt`; disable with `--no-recover-secrets`
+  that the device holds them - scan-to-folder FTP/SMB/Desktop passwords out of the exported CSV
+  and LDAP bind credentials off the settings pages. Written to `recovered_credentials.txt`;
+  disable with `--no-recover-secrets`
+- **Device memory recovery** (opt-in, `--dump-coredumps`): reads account passwords out of the
+  printer's world-readable coredumps through the pre-auth LFI, which is what recovers credentials
+  from devices whose defaults have already been changed
 - **Priority follow-up**: devices that have both a technician-level service account default *and*
   scan-to-folder destinations are flagged separately in `priority_followup.txt` — these combine
   default credentials with stored network credentials and should be remediated first
@@ -68,8 +70,8 @@ Supported today:
 3. **Fingerprint** — every listening service is matched against the enabled vendor modules.
    Only a positive match moves on.
 4. **Test credentials** — the matched vendor's default accounts, and nothing else.
-5. **Recover stored credentials** — pull the device's stored secrets back out in
-   cleartext (skip with `--no-recover-secrets`).
+5. **Recover stored credentials** — pull the device's stored secrets back out in cleartext
+   (skip with `--no-recover-secrets`; add `--dump-coredumps` for the memory source).
 6. **Check published CVEs** — for vendor modules that ship one (Sharp today), run
    active on-device probes and emit only rows that were actually confirmed. Pass
    `--include-advisories` to also emit the fingerprint-based advisory rows for
@@ -276,7 +278,14 @@ up the others:
 |---|---|---|---|
 | 1 | The address book CSV already pulled in the harvest stage | Administrator default still works | FTP / SMB / Desktop scan-to-folder passwords |
 | 2 | The LDAP settings pages, `/nw_ldap_entry.html?ldapid=N` | Administrator default still works | Directory server, bind DN, and the bind password on firmware that renders it back into the form |
-| 3 | The printer's coredumps, through the pre-auth LFI | Nothing - no login at all | Account passwords, LDAP binds, and folder credentials in cleartext |
+| 3 | The printer's coredumps, through the pre-auth LFI | Nothing - no login at all. **Opt-in: `--dump-coredumps`** | Account passwords, LDAP binds, and folder credentials in cleartext |
+
+Sources 1 and 2 run by default because they re-read configuration the scan has already
+downloaded, and they return only the credentials the device was deliberately configured to
+store. Source 3 is gated behind `--dump-coredumps` because it does something different in kind:
+it returns whatever passwords are resident in the printer's memory, including those of users who
+merely logged in. A routine subnet sweep should not produce a file full of a client's account
+passwords unless someone decided to go after them.
 
 Source 3 is the one that matters when the defaults have already been changed. Per the advisory,
 `/mnt/log` holds gzipped, world-readable (`-rw-r--r--`) coredumps of the main binary, and that
@@ -393,6 +402,9 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
   `vulnerabilities.txt` is zero-false-positive
 - `--no-recover-secrets`: skip the credential recovery stage (scan-to-folder passwords from the
   export, LDAP bind credentials, and coredump recovery)
+- `--dump-coredumps`: also recover credentials from the device's raw memory — downloads the
+  printer's world-readable coredumps through the pre-auth LFI and reads cleartext passwords out
+  of them. Off by default; needed to recover credentials from devices whose defaults were changed
 - `--creds-file <path>`: output file for recovered credentials — contains live cleartext secrets
   (default: `recovered_credentials.txt`)
 - `--recovery-max-bytes <int>`: ceiling on a single credential-recovery download, e.g. a printer
@@ -446,9 +458,17 @@ python3 printer_credcheck.py ./hosts.txt --vendor sharp --accounts 'Administrato
 ```bash
 python3 printer_credcheck.py 10.10.62.0/24 --output-dir ./engagement
 ```
-Recovery runs by default. Scan-to-folder and LDAP credentials come back from devices whose
-defaults still work; device account passwords come back from any device with the pre-auth LFI,
-including ones whose defaults were changed.
+Runs by default: scan-to-folder and LDAP credentials come back from devices whose defaults still
+work.
+
+#### Also recover credentials from device memory
+```bash
+python3 printer_credcheck.py 10.10.62.0/24 --dump-coredumps --output-dir ./engagement
+```
+Adds the coredump source, which recovers account passwords from any device with the pre-auth
+LFI — including devices whose defaults were changed, where nothing else works. This downloads
+the printer's memory and reads every password in it, so use it when the engagement calls for it
+rather than as a default.
 
 #### Skip credential recovery (findings only, no secrets on disk)
 ```bash
@@ -488,8 +508,9 @@ The scan runs in six stages:
 5. **Step 4** — harvest address books, by export where the credentials worked and by
    unauthenticated read where they did not (skipped with `--no-export`)
 6. **Step 4.5** — recover stored credentials in cleartext: scan-to-folder passwords out of the
-   exported CSV, LDAP bind credentials off the settings pages, and account passwords out of the
-   device's coredumps through the pre-auth LFI (skipped with `--no-recover-secrets`)
+   exported CSV and LDAP bind credentials off the settings pages, plus — with `--dump-coredumps`
+   — account passwords out of the device's coredumps through the pre-auth LFI (skip the whole
+   stage with `--no-recover-secrets`)
 
 Skipped endpoints are counted rather than listed; pass `--show-skipped` to see each one and
 the reason every module rejected it.

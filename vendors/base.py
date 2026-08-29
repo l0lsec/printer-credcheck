@@ -229,7 +229,8 @@ class PrinterModule:
 
     def recover_credentials(self, target: Target, ctx: ScanContext,
                             login_result: Optional["LoginResult"] = None,
-                            export_text: str = "") -> List["RecoveredCredential"]:
+                            export_text: str = "",
+                            include_coredumps: bool = False) -> List["RecoveredCredential"]:
         """
         Read stored credentials back off the device in cleartext.
 
@@ -241,6 +242,14 @@ class PrinterModule:
 
         ``export_text`` is the address book CSV already pulled in the harvest
         stage, passed in so a module can mine it without a second export.
+
+        ``include_coredumps`` gates the sources that read the device's raw
+        memory. Those return every account's password rather than the ones
+        stored for a configured destination, so they are opt-in: a routine
+        sweep should not produce a file full of a client's account passwords
+        unless someone asked it to. Sources that only re-read configuration
+        the scan already downloaded run either way.
+
         Modules that cannot recover anything return [].
         """
         return []

