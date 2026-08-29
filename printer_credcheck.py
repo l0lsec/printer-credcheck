@@ -221,9 +221,13 @@ def main() -> int:
                              "report format (default: vulnerabilities.txt)")
     parser.add_argument("--no-vuln-checks", action="store_true",
                         help="Skip the published-vulnerability stage (Sharp: pre-auth LFI "
-                             "probe against /installed_emanual_down.html plus advisory-only "
-                             "findings for CVE-2024-28038, CVE-2024-34162, CVE-2024-36248, "
-                             "hardcoded AWS keys, and CVE-2022-45796)")
+                             "probe + LFI-chained binary verification of hardcoded "
+                             "Google/AWS keys)")
+    parser.add_argument("--include-advisories", action="store_true",
+                        help="Also emit advisory-only findings for CVEs this tool cannot "
+                             "actively test without crashing or reconfiguring the device "
+                             "(CVE-2024-28038, CVE-2022-45796, CVE-2024-34162). Off by "
+                             "default so the vulnerabilities.txt output is zero-false-positive")
     parser.add_argument("--findings-delimiter", choices=["backtick", "tab"], default="backtick",
                         help="Field delimiter for the findings files (default: backtick)")
 
@@ -460,7 +464,8 @@ def main() -> int:
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = {
                     executor.submit(module.check_vulnerabilities, target, ctx,
-                                    success_by_host.get(target.hostport)): (target, module)
+                                    success_by_host.get(target.hostport),
+                                    args.include_advisories): (target, module)
                     for target, module in vuln_targets
                 }
                 for future in concurrent.futures.as_completed(futures):

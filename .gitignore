@@ -3,11 +3,18 @@ successful_logins.txt
 default_credentials.txt
 scan_to_folder.txt
 priority_followup.txt
+vulnerabilities.txt
 addressbook_*
 extracted_emails.txt
 extracted_names.txt
 extracted_usernames.txt
 hosts.txt
+
+# Skill/agent tooling installed per-machine
+.agents/
+.claude/
+skills-lock.json
+GATES.md
 
 __pycache__/
 *.pyc

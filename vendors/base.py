@@ -158,17 +158,20 @@ class PrinterModule:
         return [], [], "SKIPPED: contact scraping not supported for this vendor"
 
     def check_vulnerabilities(self, target: Target, ctx: ScanContext,
-                              login_result: Optional[LoginResult] = None) -> List["VulnFinding"]:
+                              login_result: Optional[LoginResult] = None,
+                              include_advisories: bool = False) -> List["VulnFinding"]:
         """
         Non-destructive vulnerability checks for a fingerprinted device.
 
-        Where a safe probe exists (an unauthenticated read that leaves the
-        device untouched), the check runs and returns a ``verified=True``
-        finding on a hit. For CVEs whose only reliable test would crash,
-        reboot, reconfigure, or exfiltrate real user credentials from the
-        printer, the module returns an ``verified=False`` advisory finding
-        instead, on the strength of the fingerprint and the published
-        advisory. Modules that don't implement this return an empty list.
+        Default behaviour is zero-false-positive: the module only emits a
+        finding when an active probe against this specific device confirms
+        the condition. The published advisories that this tool cannot
+        safely test (they crash the printer, rewrite its configuration, or
+        need a rogue LDAP server) are suppressed by default so no advisory
+        row can be mistaken for a proven finding in the client report.
+
+        Pass ``include_advisories=True`` to opt back in to those rows for
+        internal triage. Modules that don't implement this return [].
         """
         return []
 

